@@ -49,11 +49,21 @@
 --        CalcTextSize, not hardcoded). Title-bar injection isn't possible in this ImGui binding.
 -- v0.22: Fix v0.21 crash - imgui.CalcTextSize returns two numbers (x,y) in this binding, NOT an
 --        ImVec2, so ".x" indexed a number and threw mid-render. Use the first return directly.
+-- v0.23: Loot fixes from cazic testing. The EMU loot line names the corpse ("...looted a <item>
+--        from <corpse>'s corpse") - we now parse item + corpse separately (item name no longer
+--        polluted with "from ...'s corpse") and attribute by the line's corpse, not your target
+--        (which mis-credited a crypt-caretaker drop to the Freglor camp you were parked on).
+--        Shared PHs across camps break the tie by nearest spot loc.
+-- v0.24: Console output now matches the Unity convention - orange brackets, name colored by
+--        severity (green info / yellow warn), teal message body. YELLOW IS WARNINGS ONLY (was
+--        all-yellow before). Split the two spawn messages: named UP stays green caps
+--        "** X IS UP **"; the predictive window-open is now orange sentence-case so they no
+--        longer look identical.
 
 local mq    = require('mq')
 local imgui = require('ImGui')
 
-local VERSION  = '0.22'
+local VERSION  = '0.24'
 local myServer = mq.TLO.EverQuest.Server() or ""
 
 local function serverSlug()
@@ -176,6 +186,11 @@ local function observedAvg(intervals)
     return math.floor(sum / #intervals)
 end
 
+-- Output - matches the Unity convention: orange brackets, name colored by severity
+-- (green = info, yellow = warn), message body teal. Yellow is for WARNINGS only.
+local function info(msg) print(string.format("\ao[\agCroakWatch\ao]\at %s\ax", msg)) end
+local function warn(msg) print(string.format("\ao[\ayCroakWatch\ao]\at %s\ax", msg)) end
+
 -- Resolution chain: override > spot-cycle (>=3) > kill->kill observed (>=3) > zone default
 -- > global fallback. Spot-cycle (empty->occupied) outranks kill->kill because it's the true
 -- repop, free of your kill time. Returns seconds + a source label for the trust badge.
@@ -266,7 +281,7 @@ end
 local function loadFromAchievement(quiet)
     local achID = getAchID()
     if not achID then
-        if not quiet then mq.cmd('/echo \ay[CroakWatch]\ax No Hunter achievement found for this zone.') end
+        if not quiet then warn("No Hunter achievement found for this zone.") end
         return
     end
     local ach   = mq.TLO.Achievement(achID)
@@ -285,9 +300,9 @@ local function loadFromAchievement(quiet)
     end
     if added > 0 then
         saveAll()
-        mq.cmd(string.format('/echo \ay[CroakWatch]\ax Added %d named from \ag%s\ax', added, ach.Name()))
+        info(string.format("Added \ag%d\at named from \ag%s\at", added, ach.Name()))
     elseif not quiet then
-        mq.cmd('/echo \ay[CroakWatch]\ax All named from this achievement already tracked.')
+        info("All named from this achievement already tracked.")
     end
     rosterRebuild()
 end
@@ -319,8 +334,8 @@ local function recordKill(e, isNamed)
     if isNamed then e.namedKills = e.namedKills + 1
     else e.phKills = e.phKills + 1 end
     if not e.hidden then
-        mq.cmd(string.format('/echo \ay[CroakWatch]\ax %s %s down - respawn ~%s',
-            e.name, isNamed and "\ag[NAMED]\ax" or "[PH]", fmtDur((respawnFor(e)))))
+        info(string.format("%s %s down - respawn ~%s",
+            e.name, isNamed and "\ag[NAMED]\at" or "[PH]", fmtDur((respawnFor(e)))))
     end
     saveAll()
 end
@@ -344,29 +359,43 @@ local function onLoot(item, looter)
     for _, w in ipairs(lootWatch) do
         if item:find(w.item, 1, true) then
             w.count = w.count + 1
-            mq.cmd(string.format('/echo \ay[CroakWatch]\ax \ag[DROP]\ax %s (looted by %s, total %d)', w.item, looter or "?", w.count))
+            info(string.format("\ag[DROP]\at %s (looted by %s, total %d)", w.item, looter or "?", w.count))
             alarm(string.format("%s dropped (looted by %s)", w.item, looter or "?"), true)
             saveAll()
         end
     end
-    -- Per-named loot: only our own loot (we can only identify the corpse WE are looting). The
-    -- corpse we're targeting whose name contains the named or one of its PHs gets the credit;
-    -- PH drops roll up to the parent named. Substring match tolerates the "'s corpse" suffix.
-    if looter == "You" then
-        local corpse = mq.TLO.Target.CleanName() or ""
-        for _, e in ipairs(roster) do
-            local mine = corpse:find(e.name, 1, true) ~= nil
-            if not mine then
-                for _, ph in ipairs(e.ph) do
-                    if corpse:find(ph, 1, true) then mine = true break end
-                end
-            end
-            if mine then
-                e.loot[item] = (e.loot[item] or 0) + 1
-                saveAll()
-                break
+    -- Per-named loot: credit the camp the CORPSE belongs to. Prefer the corpse named in the loot
+    -- line (cazic includes it); fall back to your target on servers whose line omits it. Match the
+    -- corpse name to a named or one of its PHs (PH drops roll up to the parent). If a shared PH
+    -- belongs to several camps, you're standing on the corpse - credit the nearest spot.
+    if looter ~= "You" then return end
+    local src = (corpse and corpse ~= "" and corpse) or mq.TLO.Target.CleanName()
+    if not src or src == "" then return end
+    src = src:lower()
+    local hits = {}
+    for _, e in ipairs(roster) do
+        local hit = src:find(e.name:lower(), 1, true) ~= nil
+        if not hit then
+            for _, ph in ipairs(e.ph) do
+                if src:find(ph:lower(), 1, true) then hit = true break end
             end
         end
+        if hit then hits[#hits + 1] = e end
+    end
+    local pick = hits[1]
+    if #hits > 1 then
+        local mY, mX = mq.TLO.Me.Y() or 0, mq.TLO.Me.X() or 0
+        local bestD = nil
+        for _, e in ipairs(hits) do
+            if e.loc then
+                local d = (e.loc.y - mY) ^ 2 + (e.loc.x - mX) ^ 2
+                if not bestD or d < bestD then bestD, pick = d, e end
+            end
+        end
+    end
+    if pick then
+        pick.loot[item] = (pick.loot[item] or 0) + 1
+        saveAll()
     end
 end
 
@@ -384,8 +413,13 @@ end)
 -- (verified against aquietone/grimmier loot scripts). Coarse #*# filter, parse in Lua so
 -- multi-word item names survive (#1# captures one word only).
 mq.event("cw_loot", "#*#looted a #*#", function(line)
-    local item = line:match("looted a (.-)%.%-%-") or line:match("looted a (.+)%.")
-    if item then onLoot(item, line:match("%-%-(.-) ha%a+ looted a ") or "?") end
+    local looter = line:match("%-%-(.-) ha%a+ looted a ") or "?"
+    -- cazic EMU/HH form: "...looted a <item> from <corpse>'s corpse." (corpse named in the line!)
+    -- Live form: "...looted a <item>." (no corpse). Try the EMU form first, fall back to plain.
+    local item, corpse = line:match("looted a (.-) from (.+) corpse")
+    if corpse then corpse = corpse:gsub("'s?$", "")
+    else item = line:match("looted a (.-)%.%-%-") or line:match("looted a (.+)%.") end
+    if item then onLoot(item, looter, corpse) end
 end)
 
 -- Name-poll: for a named we have NOT located yet. Polls by unique name only to detect it
@@ -406,7 +440,7 @@ local function pollByName(e)
         if not e.isUp and nowUp then
             if not e.hidden then
                 local where = string.format("(%dm %s)", math.floor(sp.Distance() or 0), sp.HeadingTo.ShortName() or "?")
-                mq.cmd(string.format('/echo \ay[CroakWatch]\ax \ag** %s IS UP ** %s\ax', e.name, where))
+                info(string.format("\ag** %s IS UP **\at  %s", e.name, where))
                 alarm(e.name .. " IS UP " .. where, true)
             end
             e.alerted = true
@@ -447,7 +481,7 @@ local function pollSpot(e)
         if occ == e.name then
             if not e.isUp and not e.hidden then
                 local where = string.format("(%dm %s)", math.floor(sp.Distance() or 0), sp.HeadingTo.ShortName() or "?")
-                mq.cmd(string.format('/echo \ay[CroakWatch]\ax \ag** %s IS UP ** %s\ax', e.name, where))
+                info(string.format("\ag** %s IS UP **\at  %s", e.name, where))
                 alarm(e.name .. " IS UP " .. where, true)
             end
             e.isUp, e.alerted = true, true
@@ -461,7 +495,7 @@ local function pollSpot(e)
                     e.ph[#e.ph + 1] = occ
                     e.phCandidates[occ] = nil
                     if not e.hidden then
-                        mq.cmd(string.format('/echo \ay[CroakWatch]\ax \ag[PH discovered]\ax %s -> %s', occ, e.name))
+                        info(string.format("\ag[PH discovered]\at %s -> %s", occ, e.name))
                     end
                 end
             end
@@ -492,7 +526,7 @@ local function checkAlerts()
             if os.time() - e.killTime >= (respawnFor(e)) then
                 e.alerted = true
                 if not e.hidden then
-                    mq.cmd(string.format('/echo \ay[CroakWatch]\ax \ag** %s SPAWN WINDOW OPEN **\ax', e.name))
+                    info(string.format("\ao%s - spawn window open", e.name))
                     alarm(nil, false)
                 end
             end
@@ -872,8 +906,8 @@ if curAchID then loadFromAchievement(true) end
 rosterRebuild()
 mq.imgui.init('CroakWatch', renderUI)
 
-printf('\ay[CroakWatch v%s]\ax loaded for \ag%s\ax. Tracking %d named in this zone.%s /croakwatch to minimize/restore.',
-    VERSION, myServer ~= "" and myServer or "?", #roster, curAchID and " Hunter achievement found." or "")
+info(string.format("v%s loaded for \ag%s\at. Tracking \ag%d\at named in this zone.%s /croakwatch to minimize/restore.",
+    VERSION, myServer ~= "" and myServer or "?", #roster, curAchID and " Hunter achievement found." or ""))
 
 local lastZone = mq.TLO.Zone.ID()
 local tick = 0

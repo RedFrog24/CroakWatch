@@ -1,5 +1,6 @@
 # Local-only files - never ship to the RedGuides-linked repo.
-# Only init.lua (and any runtime assets) + the publish workflow should be tracked.
+# Only init.lua (+ README + any runtime assets) + the publish workflow should be tracked.
 *.md
+!README.md
 backup/
 .claude/

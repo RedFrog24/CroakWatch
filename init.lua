@@ -59,11 +59,15 @@
 --        all-yellow before). Split the two spawn messages: named UP stays green caps
 --        "** X IS UP **"; the predictive window-open is now orange sentence-case so they no
 --        longer look identical.
+-- v0.25: Countdown bar readability. Bar height is now GetFrameHeight() (was a hardcoded 14 that
+--        clipped the text); the label is drawn by us with a black shadow via the draw list, so
+--        the white text stays readable where the bright fill creeps over it. (Uses the *Vec
+--        ImGui calls verified from AL's statusbar.lua - CalcTextSizeVec/GetCursorScreenPosVec.)
 
 local mq    = require('mq')
 local imgui = require('ImGui')
 
-local VERSION  = '0.24'
+local VERSION  = '0.25'
 local myServer = mq.TLO.EverQuest.Server() or ""
 
 local function serverSlug()
@@ -634,9 +638,20 @@ local function renderRow(e)
             if pct > 0.5 then r, g, b = 1.0, 0.3, 0.3
             elseif pct > 0.2 then r, g, b = 1.0, 0.85, 0.2
             else r, g, b = 0.3, 1.0, 0.3 end
+            local barH   = imgui.GetFrameHeight()                   -- font + padding: fits text (was 14, clipped)
+            local barPos = imgui.GetCursorScreenPosVec()            -- top-left before drawing (Vec = ImVec2)
+            local barW   = imgui.GetContentRegionAvailVec().x       -- ProgressBar(-1) fills this width
             imgui.PushStyleColor(ImGuiCol.PlotHistogram, r, g, b, 0.85)
-            imgui.ProgressBar(math.min(1.0, elapsed / rs), -1, 14, fmtClock(remaining) .. " until window")
+            imgui.ProgressBar(math.min(1.0, elapsed / rs), -1, barH, "")   -- no built-in overlay
             imgui.PopStyleColor()
+            -- draw the label ourselves with a shadow so white stays readable over the bright fill
+            local label = fmtClock(remaining) .. " until window"
+            local ts = imgui.CalcTextSizeVec(label)
+            local lx = barPos.x + (barW - ts.x) * 0.5
+            local ly = barPos.y + (barH - ts.y) * 0.5
+            local dl = imgui.GetWindowDrawList()
+            dl:AddText(ImVec2(lx + 1, ly + 1), IM_COL32(0, 0, 0, 220), label)
+            dl:AddText(ImVec2(lx, ly), IM_COL32(255, 255, 255, 255), label)
         else
             local flash = (math.floor(mq.gettime() / 500) % 2 == 0)
             local lbl   = string.format("  ** WINDOW OPEN **  (%s past)", fmtClock(-remaining))

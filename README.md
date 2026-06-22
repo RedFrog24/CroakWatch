@@ -6,11 +6,11 @@
 
 CroakWatch is a mob camp manager for Live and EMU. Point it at a zone and it builds your hunt list, then watches every camp for you: who's up, when the next one's due, and what's been dropping. It also learns. Respawn timers self-correct to whatever server you're on by watching the real kill cycle.
 
-Live "is it up?" detection + spawn-window countdowns that learn per server
-Automatic placeholder discovery, with a kill/named ratio per camp
-Per-camp loot history and a global item-drop radar with alerts
-Hide camps you don't care about (fully silenced), a pause toggle, and a tidy mini-icon mode
-Separate save data per server — your Live and EMU progress never mix
+- Live "is it up?" detection + spawn-window countdowns that learn per server
+- Automatic placeholder discovery, with a kill/named ratio per camp
+- Per-camp loot history and a global item-drop radar with alerts
+- Hide camps you don't care about (fully silenced), a pause toggle, and a tidy mini-icon mode
+- Separate save data per server — your Live and EMU progress never mix
 
 Your data lives in `config/croakwatch/croakwatch_<server>.lua`, one file per server — updating the script never wipes your timers or loot history.
 

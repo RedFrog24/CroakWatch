@@ -2,7 +2,7 @@
 
 > Watching things croak, so you don't have to... and more.
 
-![CroakWatch tracking named camps in Old Sebilis](images/croakwatch.png)
+![CroakWatch tracking named camps in Old Sebilis](assets/images/croakwatch.png)
 
 CroakWatch is a mob camp manager for Live and EMU. Point it at a zone and it builds your hunt list, then watches every camp for you: who's up, when the next one's due, and what's been dropping. It also learns. Respawn timers self-correct to whatever server you're on by watching the real kill cycle.
 

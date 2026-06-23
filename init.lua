@@ -63,11 +63,37 @@
 --        clipped the text); the label is drawn by us with a black shadow via the draw list, so
 --        the white text stays readable where the bright fill creeps over it. (Uses the *Vec
 --        ImGui calls verified from AL's statusbar.lua - CalcTextSizeVec/GetCursorScreenPosVec.)
+-- v0.26: Sound pipeline. Named UP now SPEAKS the name via MQTextToSpeech (/tts say "X is up",
+--        loaded at startup + unloaded on exit if we loaded it; double-beep fallback if absent).
+--        Window-open + watched-loot now play WAV chimes via /beep <abspath> (PlaySound, async)
+--        from assets/sounds/ - filenames are config vars (WINDOW_WAV / LOOT_WAV). All still
+--        gated by the Sound toggle + hidden mobs stay silent.
+-- v0.27: "Sound Test" collapsing panel - a Play button per WAV in assets/sounds/ (auto-listed via
+--        lfs), plus a Test Voice button. Tags which file is the current [window]/[loot]. Lets you
+--        audition every sound in-game without /beep paths. (Future home: the OPTIONS tab.)
+-- v0.28: Test Voice now speaks a REAL named from the current zone ("<name> is up") instead of the
+--        literal "named is up", so the test matches what an actual spawn says.
+-- v0.29: BUGFIX (RG reviewer): onLoot was declared (item, looter) but the loot event calls it
+--        with a 3rd arg (corpse). Lua silently drops extra args, so `corpse` inside onLoot was an
+--        undeclared global = nil, and per-named attribution ALWAYS fell back to Target.CleanName()
+--        - silently disabling the whole v0.23 corpse-attribution fix. Added the `corpse` param.
+-- v0.30: Self-healing migration in loadAll - cleans the pre-v0.29 polluted loot keys
+--        ("<item> from <corpse>'s corpse") left in old save files, normalizing them to the clean
+--        item name (counts merged). Runs once per load; no-op after the data is clean.
+-- v0.31: PH auto-discovery no longer learns another roster NAMED as a placeholder (a named
+--        crossing a spot, e.g. Emperor Chottal, was getting flagged as a PH). Clearer message
+--        too: "<ph> is a placeholder for <named>" (the old "occ -> named" arrow misread).
+-- v0.32: Root cause of v0.31 wasn't roaming - two named (Emperor Chottal + blood of chottal)
+--        SHARE a room, within the 30u spotRadius, so one's spot poll saw the other. Now pollSpot
+--        checks THIS named by its unique name first (unambiguous regardless of who's nearer to
+--        you), and only then looks for a PH - ignoring any neighbouring named. Fixes the PH
+--        mis-discovery AND keeps the spot-cycle clock clean for densely-packed camps. Named text
+--        in the PH message is now purple (\ap) to stand out.
 
 local mq    = require('mq')
 local imgui = require('ImGui')
 
-local VERSION  = '0.25'
+local VERSION  = '0.32'
 local myServer = mq.TLO.EverQuest.Server() or ""
 
 local function serverSlug()
@@ -229,6 +255,7 @@ end
 local function loadAll()
     local saved = mq.unpickle(SAVE_FILE, {}) or {}
     db = {}
+    local migrated = false
     if saved.named then
         for key, e in pairs(saved.named) do
             e.ph            = e.ph or {}
@@ -238,11 +265,24 @@ local function loadAll()
             e.spotIntervals = e.spotIntervals or {}
             e.phCandidates  = e.phCandidates or {}
             e.loot          = e.loot or {}
+            -- Migration (self-healing): pre-v0.29 saved loot keys polluted with
+            -- "<item> from <corpse>'s corpse". Normalize to the clean item name, merging counts.
+            local renames = {}
+            for k, v in pairs(e.loot) do
+                local clean = k:match("^(.-) from .+ corpse$")
+                if clean and clean ~= "" then renames[#renames + 1] = { k, clean, v } end
+            end
+            for _, r in ipairs(renames) do
+                e.loot[r[2]] = (e.loot[r[2]] or 0) + r[3]
+                e.loot[r[1]] = nil
+                migrated = true
+            end
             db[key] = e
         end
     end
     lootWatch = saved.loot or {}
     for _, w in ipairs(lootWatch) do w.count = w.count or 0 end
+    if migrated then saveAll() end   -- persist the cleanup immediately
 end
 
 -- Achievement roster
@@ -311,16 +351,47 @@ local function loadFromAchievement(quiet)
     rosterRebuild()
 end
 
--- Alerts
+-- Alerts / sounds
 
 local soundOn = true
+-- Per-event sounds (swap the filenames to any WAV in assets/sounds/).
+local SOUND_DIR  = (((mq.luaDir or '') .. '/croakwatch/assets/sounds/'):gsub('\\', '/'))
+local WINDOW_WAV = 'window_twonote.wav'   -- spawn-window-open chime
+local LOOT_WAV   = 'loot_coin.wav'         -- watched-item drop sound
+local TTS_PLUGIN = 'MQTextToSpeech'
+local ttsLoadedByUs = false
 
--- big = the important named-up alert (beep + on-screen popup); else a plain beep
-local function alarm(popupText, big)
+-- /beep <file> plays a WAV async via Windows PlaySound (verified in MQ source). Quote for spaces.
+local function playWav(file)
     if not soundOn then return end
-    mq.cmd('/beep')
-    if big and popupText then mq.cmd('/popup ' .. popupText) end
+    mq.cmdf('/beep "%s%s"', SOUND_DIR, file)
 end
+
+-- Named up: speak the name via TTS if available, else a double-beep fallback. Plus the popup.
+local function namedUpAlert(name, where)
+    if not soundOn then return end
+    mq.cmd('/popup ' .. name .. ' IS UP ' .. where)
+    if mq.TLO.Plugin(TTS_PLUGIN).IsLoaded() then
+        mq.cmdf('/tts say "%s is up"', name)
+    else
+        mq.cmd('/beep'); mq.cmd('/beep')
+    end
+end
+
+-- List the WAVs in assets/sounds/ for the in-game Sound Test panel (scanned once; Refresh re-scans).
+local function listSounds()
+    local files = {}
+    if okLfs then
+        pcall(function()
+            for f in lfs.dir(SOUND_DIR) do
+                if f:lower():match("%.wav$") then files[#files + 1] = f end
+            end
+        end)
+        table.sort(files)
+    end
+    return files
+end
+local soundFiles = listSounds()
 
 -- Kill + loot detection
 
@@ -357,14 +428,15 @@ local function onKill(mobName)
     end
 end
 
-local function onLoot(item, looter)
+local function onLoot(item, looter, corpse)
     if paused then return end
     -- Global Loot Watch: targeted radar for items anywhere, anyone (item-name substring match).
     for _, w in ipairs(lootWatch) do
         if item:find(w.item, 1, true) then
             w.count = w.count + 1
             info(string.format("\ag[DROP]\at %s (looted by %s, total %d)", w.item, looter or "?", w.count))
-            alarm(string.format("%s dropped (looted by %s)", w.item, looter or "?"), true)
+            if soundOn then mq.cmd('/popup ' .. w.item .. ' dropped') end
+            playWav(LOOT_WAV)
             saveAll()
         end
     end
@@ -445,7 +517,7 @@ local function pollByName(e)
             if not e.hidden then
                 local where = string.format("(%dm %s)", math.floor(sp.Distance() or 0), sp.HeadingTo.ShortName() or "?")
                 info(string.format("\ag** %s IS UP **\at  %s", e.name, where))
-                alarm(e.name .. " IS UP " .. where, true)
+                namedUpAlert(e.name, where)
             end
             e.alerted = true
         elseif e.isUp and not nowUp then
@@ -464,8 +536,22 @@ end
 -- stored y,x,z); radius is required.
 local function pollSpot(e)
     local r   = e.spotRadius or SPOT_RADIUS_DEFAULT
-    local sp  = mq.TLO.NearestSpawn(string.format('npc loc %d %d %d radius %d', e.loc.x, e.loc.y, e.loc.z, r))
-    local occ = sp() ~= nil and sp.CleanName() or nil
+    -- Who's on the spot? Check THIS named by its (unique) name first - unambiguous even when a
+    -- neighbouring named shares the room (NearestSpawn returns whoever's nearer to YOU, which could
+    -- be the neighbour). If our named isn't up, the nearest mob at the spot that ISN'T a roster
+    -- named is a PH; a neighbouring named is ignored (spot reads empty) so it pollutes neither PH
+    -- discovery nor the spot-cycle clock. PHs are generic trash, never named.
+    local occ
+    local sp = mq.TLO.Spawn(string.format('npc "%s"', e.name))   -- this named, anywhere (unique name)
+    if sp() ~= nil then
+        occ = e.name
+    else
+        sp = mq.TLO.NearestSpawn(string.format('npc loc %d %d %d radius %d', e.loc.x, e.loc.y, e.loc.z, r))
+        occ = sp() ~= nil and sp.CleanName() or nil
+        if occ then
+            for _, e2 in ipairs(roster) do if e2.name == occ then occ = nil break end end
+        end
+    end
 
     if not e.spotSeen then   -- first pass: adopt current state silently (no load-time alert)
         e.spotSeen, e.spotOccupant, e.isUp = true, occ, occ == e.name
@@ -486,11 +572,11 @@ local function pollSpot(e)
             if not e.isUp and not e.hidden then
                 local where = string.format("(%dm %s)", math.floor(sp.Distance() or 0), sp.HeadingTo.ShortName() or "?")
                 info(string.format("\ag** %s IS UP **\at  %s", e.name, where))
-                alarm(e.name .. " IS UP " .. where, true)
+                namedUpAlert(e.name, where)
             end
             e.isUp, e.alerted = true, true
         else
-            e.isUp = false
+            e.isUp = false   -- occ here is a generic mob (neighbour named already nil'd above)
             local known = false
             for _, ph in ipairs(e.ph) do if ph == occ then known = true break end end
             if not known then
@@ -499,7 +585,7 @@ local function pollSpot(e)
                     e.ph[#e.ph + 1] = occ
                     e.phCandidates[occ] = nil
                     if not e.hidden then
-                        info(string.format("\ag[PH discovered]\at %s -> %s", occ, e.name))
+                        info(string.format("\ag[PH discovered]\at %s is a placeholder for \ap%s", occ, e.name))
                     end
                 end
             end
@@ -531,7 +617,7 @@ local function checkAlerts()
                 e.alerted = true
                 if not e.hidden then
                     info(string.format("\ao%s - spawn window open", e.name))
-                    alarm(nil, false)
+                    playWav(WINDOW_WAV)
                 end
             end
         end
@@ -546,7 +632,6 @@ local showHidden = false
 local lootInput  = ""
 
 local addName, addPH, addOverride = "", "", 0
-local editKey = nil
 local editOverride, editPH, editHidden, editSpotRadius = 0, "", false, 0
 
 -- Purple/gold theme (Unity palette). Pushed before Begin so it skins the chrome.
@@ -684,7 +769,6 @@ local function renderRow(e)
     end
     imgui.SameLine()
     if imgui.SmallButton("Edit") then
-        editKey        = dbKey(e.zone, e.name)
         editOverride   = e.override and math.floor(e.override / 60) or 0
         editPH         = joinCSV(e.ph)
         editHidden     = e.hidden
@@ -803,6 +887,29 @@ local function renderLootWatch()
     end
 end
 
+-- Audition every WAV in assets/sounds/ in-game. (Future home: the OPTIONS tab.)
+local function renderSoundTest()
+    if not imgui.CollapsingHeader("Sound Test") then return end
+    local ttsOk = mq.TLO.Plugin(TTS_PLUGIN).IsLoaded()
+    if imgui.SmallButton("Test Voice") then
+        local sample = (roster[1] and roster[1].name) or "Frenzied Ghoul"   -- demo the real "<name> is up"
+        if ttsOk then mq.cmdf('/tts say "%s is up"', sample) else mq.cmd('/beep'); mq.cmd('/beep') end
+    end
+    imgui.SameLine(); imgui.TextDisabled(ttsOk and "(TTS loaded)" or "(no TTS - double beep)")
+    imgui.SameLine()
+    if imgui.SmallButton("Refresh") then soundFiles = listSounds() end
+    imgui.Separator()
+    if #soundFiles == 0 then imgui.TextDisabled("  no .wav files in assets/sounds/") end
+    for _, f in ipairs(soundFiles) do
+        imgui.PushID(f)
+        if imgui.SmallButton("Play") then mq.cmdf('/beep "%s%s"', SOUND_DIR, f) end
+        imgui.SameLine(); imgui.TextDisabled(f)
+        if f == WINDOW_WAV then imgui.SameLine(); imgui.TextColored(0.55, 0.75, 1.0, 1, "[window]") end
+        if f == LOOT_WAV   then imgui.SameLine(); imgui.TextColored(0.40, 0.90, 0.50, 1, "[loot]") end
+        imgui.PopID()
+    end
+end
+
 local function renderMain()
     local nc, nv = pushTheme()
     imgui.SetNextWindowSize(360, 480, ImGuiCond.FirstUseEver)
@@ -839,6 +946,7 @@ local function renderMain()
     imgui.SameLine(); soundOn    = imgui.Checkbox("Sound", soundOn)
 
     renderLootWatch()
+    renderSoundTest()
     imgui.Separator()
 
     imgui.BeginChild("##list", 0, -imgui.GetFrameHeightWithSpacing(), true)
@@ -919,10 +1027,18 @@ curZoneShort = mq.TLO.Zone.ShortName() or ""
 refreshAch()
 if curAchID then loadFromAchievement(true) end
 rosterRebuild()
+
+-- Load TTS for spoken Named alerts; remember if WE loaded it so we can unload on exit.
+if not mq.TLO.Plugin(TTS_PLUGIN).IsLoaded() then
+    mq.cmd('/plugin ' .. TTS_PLUGIN)
+    mq.delay(500)
+    ttsLoadedByUs = mq.TLO.Plugin(TTS_PLUGIN).IsLoaded()
+end
+
 mq.imgui.init('CroakWatch', renderUI)
 
-info(string.format("v%s loaded for \ag%s\at. Tracking \ag%d\at named in this zone.%s /croakwatch to minimize/restore.",
-    VERSION, myServer ~= "" and myServer or "?", #roster, curAchID and " Hunter achievement found." or ""))
+info(string.format("v%s loaded for \ag%s\at. Tracking \ag%d\at named in this zone. /croakwatch to minimize/restore.",
+    VERSION, myServer ~= "" and myServer or "?", #roster))
 
 local lastZone = mq.TLO.Zone.ID()
 local tick = 0
@@ -945,3 +1061,6 @@ while running do
     end
     mq.delay(500)
 end
+
+-- Clean up: only unload TTS if we were the ones who loaded it.
+if ttsLoadedByUs then mq.cmd('/plugin ' .. TTS_PLUGIN .. ' unload') end

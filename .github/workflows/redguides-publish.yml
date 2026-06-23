@@ -49,8 +49,7 @@ jobs:
         env:
           REDGUIDES_API_KEY: ${{ secrets.REDGUIDES_API_KEY }}
         with:
-          # TODO: replace 0 with the CroakWatch RedGuides resource ID once the resource exists (AL to provide).
-          resource_id: "0"
+          resource_id: "3328"
           # README.md becomes the resource Overview on each release (edit the README, not the RG page).
           description: "README.md"
           version: "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.event.release.tag_name }}"

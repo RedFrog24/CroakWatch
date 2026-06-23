@@ -89,11 +89,24 @@
 --        you), and only then looks for a PH - ignoring any neighbouring named. Fixes the PH
 --        mis-discovery AND keeps the spot-cycle clock clean for densely-packed camps. Named text
 --        in the PH message is now purple (\ap) to stand out.
+-- v0.33: Voice picker in the Sound Test panel - shows the current MQTextToSpeech voice and buttons
+--        for the common Windows voices -> `/tts voice <name>` (substring match). The plugin
+--        doesn't expose the installed list to scripts, so it's a curated set.
+-- v0.34: Trimmed the voice quick-picks to the universal three (David/Zira/Mark) since a curated
+--        name the user doesn't have makes /tts voice fall back to a default (knocking them off
+--        their pick). Added a type-any field + Set, since we can't enumerate installed voices.
+-- v0.35: Loot sound locked to loot_fantasy_clean.wav (fantasy harp sweep into a clean major
+--        resolve - no add9/bell-tail/sparkle, which read as arcade). Window still on twonote.
+-- v0.36: STABLE sound filenames - ships assets/sounds/{loot.wav, window.wav}; to change a sound
+--        we swap the file's CONTENTS, not its name, so updates overwrite in place (no orphan WAVs
+--        on users' disks). The synth tool moved to the shared Scripts/tools/ (generates into
+--        tools/out/sounds/; keepers get copied in as loot.wav/window.wav). loot.wav = the fantasy
+--        harp; window.wav = twonote for now (swap when AL picks).
 
 local mq    = require('mq')
 local imgui = require('ImGui')
 
-local VERSION  = '0.32'
+local VERSION  = '0.36'
 local myServer = mq.TLO.EverQuest.Server() or ""
 
 local function serverSlug()
@@ -356,9 +369,12 @@ end
 local soundOn = true
 -- Per-event sounds (swap the filenames to any WAV in assets/sounds/).
 local SOUND_DIR  = (((mq.luaDir or '') .. '/croakwatch/assets/sounds/'):gsub('\\', '/'))
-local WINDOW_WAV = 'window_twonote.wav'   -- spawn-window-open chime
-local LOOT_WAV   = 'loot_coin.wav'         -- watched-item drop sound
+local WINDOW_WAV = 'window.wav'   -- stable name: swap the file's CONTENTS to change the sound (no orphans)
+local LOOT_WAV   = 'loot.wav'     -- "
 local TTS_PLUGIN = 'MQTextToSpeech'
+-- Common Windows voices. The plugin substring-matches (so "Zira" -> "Microsoft Zira") and doesn't
+-- expose the installed list to scripts, so this is a curated set; users with others use /tts voice.
+local TTS_VOICES = { "David", "Zira", "Mark" }
 local ttsLoadedByUs = false
 
 -- /beep <file> plays a WAV async via Windows PlaySound (verified in MQ source). Quote for spaces.
@@ -630,6 +646,7 @@ local minimized  = false
 local filterMode = 0          -- 0 all, 1 up, 2 need
 local showHidden = false
 local lootInput  = ""
+local voiceInput = ""
 
 local addName, addPH, addOverride = "", "", 0
 local editOverride, editPH, editHidden, editSpotRadius = 0, "", false, 0
@@ -898,6 +915,18 @@ local function renderSoundTest()
     imgui.SameLine(); imgui.TextDisabled(ttsOk and "(TTS loaded)" or "(no TTS - double beep)")
     imgui.SameLine()
     if imgui.SmallButton("Refresh") then soundFiles = listSounds() end
+    if ttsOk then
+        imgui.TextDisabled("Voice:")
+        imgui.SameLine(); imgui.TextColored(0.55, 0.45, 0.75, 1, mq.TLO.TTS.Voice() or "?")
+        for i, v in ipairs(TTS_VOICES) do
+            if i > 1 then imgui.SameLine() end
+            if imgui.SmallButton(v) then mq.cmdf('/tts voice %s', v) end
+        end
+        imgui.SameLine(); imgui.SetNextItemWidth(80)
+        voiceInput = imgui.InputText("##voicein", voiceInput, 64)
+        imgui.SameLine()
+        if imgui.SmallButton("Set##voice") and voiceInput ~= "" then mq.cmdf('/tts voice %s', voiceInput) end
+    end
     imgui.Separator()
     if #soundFiles == 0 then imgui.TextDisabled("  no .wav files in assets/sounds/") end
     for _, f in ipairs(soundFiles) do

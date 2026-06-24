@@ -106,11 +106,16 @@
 --        self + group, so solo is counted correctly), and a warn() + intruder.wav chime when a NEW
 --        player enters. First scan after load/zone-change adopts silently (no spam). Toggle on the
 --        zone-watch line; alert sound rides the global Sound toggle.
+-- v0.38: Camp Watch - a bottom footer that logs a unified feed (intruder arrivals + ALL OOC +
+--        tells) in-memory (last 150 lines, clears on restart). Header blinks while unread (even
+--        collapsed); expanding acknowledges. campwatch.wav chime (toggle): tells always ring,
+--        OOC throttled to cut spam, intruder keeps its own sound. Self-tells filtered (EMU echo).
 
 local mq    = require('mq')
 local imgui = require('ImGui')
+local Icons = require('mq.Icons')
 
-local VERSION  = '0.37'
+local VERSION  = '0.38'
 local myServer = mq.TLO.EverQuest.Server() or ""
 
 local function serverSlug()
@@ -376,11 +381,19 @@ local zoneWatch       = true   -- feature toggle (zone-watch line); badge + aler
 local zonePcs         = {}     -- last-seen set of other-player names, for the new-arrival diff
 local zonePcsList     = {}     -- {name, level, class, guild} for the hover tooltip
 local zonePcsBaseline = false  -- first scan after load/zone-change adopts silently (no alert spam)
+-- Camp Watch: in-memory feed (intruder + OOC + tells) for the bottom footer. Clears on restart.
+local watchFeed     = {}       -- ring buffer { {t, kind, text} }, capped 150, newest appended
+local watchUnread   = false    -- drives the blinking header (set on new event, cleared on expand)
+local watchNewCount = 0        -- count since last acknowledge (the "(N new)" badge)
+local watchOpen     = false    -- footer section expanded?
+local watchSound    = true     -- Camp Watch sound toggle (also gated by global soundOn)
+local lastWatchSound = 0       -- throttle: ms of the last OOC/zone chime (tells bypass it)
 -- Per-event sounds (swap the filenames to any WAV in assets/sounds/).
 local SOUND_DIR  = (((mq.luaDir or '') .. '/croakwatch/assets/sounds/'):gsub('\\', '/'))
 local WINDOW_WAV = 'window.wav'   -- stable name: swap the file's CONTENTS to change the sound (no orphans)
 local LOOT_WAV   = 'loot.wav'     -- "
 local INTRUDER_WAV = 'intruder.wav'   -- a new non-group player entered the zone
+local WATCH_WAV    = 'campwatch.wav'  -- Camp Watch notification (OOC / tell)
 local TTS_PLUGIN = 'MQTextToSpeech'
 -- Common Windows voices. The plugin substring-matches (so "Zira" -> "Microsoft Zira") and doesn't
 -- expose the installed list to scripts, so this is a curated set; users with others use /tts voice.
@@ -401,6 +414,22 @@ local function namedUpAlert(name, where)
         mq.cmdf('/tts say "%s is up"', name)
     else
         mq.cmd('/beep'); mq.cmd('/beep')
+    end
+end
+
+-- Camp Watch: append one line to the feed + flag it unread (drives the blink). Sound rules:
+-- intruder ("zone") already plays its own; tells always knock; OOC is throttled to cut spam.
+local function watchPush(kind, text)
+    watchFeed[#watchFeed + 1] = { t = os.date("%H:%M:%S"), kind = kind, text = text }
+    if #watchFeed > 150 then table.remove(watchFeed, 1) end
+    watchUnread = true
+    watchNewCount = watchNewCount + 1
+    if kind ~= "zone" and watchSound then
+        local now = mq.gettime()
+        if kind == "tell" or now - lastWatchSound > 4000 then
+            playWav(WATCH_WAV)
+            lastWatchSound = now
+        end
     end
 end
 
@@ -522,6 +551,18 @@ mq.event("cw_loot", "#*#looted a #*#", function(line)
     if corpse then corpse = corpse:gsub("'s?$", "")
     else item = line:match("looted a (.-)%.%-%-") or line:match("looted a (.+)%.") end
     if item then onLoot(item, looter, corpse) end
+end)
+-- Camp Watch capture (parse in Lua so multi-word names/messages survive). Loose patterns; the exact
+-- OOC/tell strings are verified in-game (the event simply won't fire if a server's format differs).
+mq.event("cw_ooc", "#*# says out of character, #*#", function(line)
+    local who, msg = line:match("^(.-) says out of character, '(.*)'")
+    if who and msg then watchPush("ooc", string.format('%s: "%s"', who, msg)) end
+end)
+mq.event("cw_tell", "#*# tells you, #*#", function(line)
+    local who, msg = line:match("^(.-) tells you, '(.*)'")
+    if who and msg and who ~= (mq.TLO.Me.CleanName() or "") then   -- drop self-tells (EMU echo)
+        watchPush("tell", string.format('%s: "%s"', who, msg))
+    end
 end)
 
 -- Name-poll: for a named we have NOT located yet. Polls by unique name only to detect it
@@ -677,9 +718,11 @@ local function pollZonePcs()
     if zonePcsBaseline then
         for _, p in ipairs(list) do
             if not zonePcs[p.name] then
-                warn(string.format("%s (%d %s)%s entered the zone", p.name, p.level, p.class,
-                    p.guild ~= "" and (" <" .. p.guild .. ">") or ""))
+                local desc = string.format("%s (%d %s)%s entered the zone", p.name, p.level, p.class,
+                    p.guild ~= "" and (" <" .. p.guild .. ">") or "")
+                warn(desc)
                 playWav(INTRUDER_WAV)
+                watchPush("zone", desc)
             end
         end
     else
@@ -987,10 +1030,50 @@ local function renderSoundTest()
     end
 end
 
+-- Camp Watch footer: blinking header (pulses even when collapsed) + the unified feed. Clicking the
+-- header toggles + acknowledges (stops the blink). A camp-safety glance for AFK.
+local function renderCampWatch()
+    imgui.Separator()
+    if watchUnread then
+        local p = 0.5 + 0.5 * math.sin(mq.gettime() / 150)
+        imgui.PushStyleColor(ImGuiCol.Text, 0.93, 0.74, 0.33, 0.45 + 0.55 * p)
+    else
+        imgui.PushStyleColor(ImGuiCol.Text, 0.70, 0.62, 0.32, 1)
+    end
+    imgui.Text(string.format("%s Camp Watch%s", watchOpen and "v" or ">",
+        watchNewCount > 0 and string.format("  (%d new)", watchNewCount) or ""))
+    imgui.PopStyleColor()
+    if imgui.IsItemClicked() then
+        watchOpen = not watchOpen
+        if watchOpen then watchUnread = false; watchNewCount = 0 end
+    end
+    imgui.SameLine(imgui.GetWindowWidth() - 28)
+    if watchSound then imgui.PushStyleColor(ImGuiCol.Text, 0.85, 0.70, 0.32, 1)   -- gold = on
+    else imgui.PushStyleColor(ImGuiCol.Text, 0.45, 0.42, 0.50, 1) end             -- grey = off
+    imgui.Text(Icons.FA_VOLUME_UP)
+    imgui.PopStyleColor()
+    if imgui.IsItemClicked() then watchSound = not watchSound end
+    if imgui.IsItemHovered() then imgui.SetTooltip(watchSound and "Camp Watch sound: on" or "Camp Watch sound: off") end
+    if watchOpen then
+        imgui.BeginChild("##watchfeed", 0, 120, true)
+        if #watchFeed == 0 then imgui.TextDisabled("  (quiet - nothing yet)") end
+        for i = #watchFeed, 1, -1 do
+            local e = watchFeed[i]
+            local r, g, b = 0.34, 0.78, 0.78
+            if e.kind == "tell" then r, g, b = 0.42, 0.80, 0.37
+            elseif e.kind == "zone" then r, g, b = 0.91, 0.72, 0.31 end
+            imgui.PushStyleColor(ImGuiCol.Text, r, g, b, 1)
+            imgui.TextWrapped(string.format("[%s] %s  %s", e.t, e.kind, e.text))
+            imgui.PopStyleColor()
+        end
+        imgui.EndChild()
+    end
+end
+
 local function renderMain()
     local nc, nv = pushTheme()
     imgui.SetNextWindowSize(360, 480, ImGuiCond.FirstUseEver)
-    local pOpen, shouldDraw = imgui.Begin("CroakWatch v" .. VERSION .. "##CroakWatch", true)
+    local pOpen, shouldDraw = imgui.Begin("CroakWatch v" .. VERSION .. "##CroakWatch", true, ImGuiWindowFlags.NoScrollbar)
     if not pOpen then
         running = false   -- X closes AND stops; use the mini-icon (_) to keep it running
         imgui.End(); imgui.PopStyleColor(nc); imgui.PopStyleVar(nv)
@@ -1045,7 +1128,7 @@ local function renderMain()
     renderSoundTest()
     imgui.Separator()
 
-    imgui.BeginChild("##list", 0, -imgui.GetFrameHeightWithSpacing(), true)
+    imgui.BeginChild("##list", 0, -(imgui.GetFrameHeightWithSpacing() * 2 + 14 + (watchOpen and 130 or 0)), true)
     local vis = {}
     for _, e in ipairs(roster) do
         if showHidden or not e.hidden then
@@ -1077,6 +1160,8 @@ local function renderMain()
         if imgui.Button("Load from Achievement") then loadFromAchievement() end
     end
     renderAddPopup()
+
+    renderCampWatch()
 
     imgui.End(); imgui.PopStyleColor(nc); imgui.PopStyleVar(nv)
 end

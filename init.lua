@@ -112,12 +112,16 @@
 --        OOC throttled to cut spam, intruder keeps its own sound. Self-tells filtered (EMU echo).
 -- v0.39: Themed the roster list scrollbar - rounded grab (ScrollbarRounding) + purple matching the
 --        buttons (ScrollbarGrab/Hovered/Active), added to pushTheme.
+-- v0.40: pollZonePcs now enumerates players via mq.getFilteredSpawns(Type=='PC') in one call
+--        instead of an indexed NearestSpawn loop - cleaner + one query per tick (same result).
+-- v0.41: Camp Watch - a Clear button (in the expanded header) wipes the feed, and the feed
+--        auto-clears on zone change (stale OOC/intruder lines from the last camp).
 
 local mq    = require('mq')
 local imgui = require('ImGui')
 local Icons = require('mq.Icons')
 
-local VERSION  = '0.39'
+local VERSION  = '0.41'
 local myServer = mq.TLO.EverQuest.Server() or ""
 
 local function serverSlug()
@@ -708,9 +712,8 @@ local function pollZonePcs()
         end
     end
     local now, list = {}, {}
-    for i = 1, (mq.TLO.SpawnCount('pc')() or 0) do
-        local sp = mq.TLO.NearestSpawn(i, 'pc')
-        local n  = sp() ~= nil and sp.CleanName() or nil
+    for _, sp in ipairs(mq.getFilteredSpawns(function(s) return s.Type() == 'PC' end)) do
+        local n = sp.CleanName()
         if n and n ~= myName and not grp[n] then
             now[n] = true
             list[#list + 1] = { name = n, level = sp.Level() or 0,
@@ -1054,6 +1057,10 @@ local function renderCampWatch()
         watchOpen = not watchOpen
         if watchOpen then watchUnread = false; watchNewCount = 0 end
     end
+    if watchOpen then
+        imgui.SameLine(imgui.GetWindowWidth() - 92)
+        if imgui.SmallButton("Clear") then watchFeed, watchUnread, watchNewCount = {}, false, 0 end
+    end
     imgui.SameLine(imgui.GetWindowWidth() - 28)
     if watchSound then imgui.PushStyleColor(ImGuiCol.Text, 0.85, 0.70, 0.32, 1)   -- gold = on
     else imgui.PushStyleColor(ImGuiCol.Text, 0.45, 0.42, 0.50, 1) end             -- grey = off
@@ -1239,6 +1246,7 @@ while running do
         if curAchID then loadFromAchievement(true) end
         rosterRebuild()
         zonePcs, zonePcsList, zonePcsBaseline = {}, {}, false   -- re-adopt the new zone's crowd silently
+        watchFeed, watchUnread, watchNewCount = {}, false, 0     -- last camp's OOC/intruder lines are stale
         lastZone = z
     end
     mq.doevents()

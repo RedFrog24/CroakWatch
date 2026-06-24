@@ -102,11 +102,15 @@
 --        on users' disks). The synth tool moved to the shared Scripts/tools/ (generates into
 --        tools/out/sounds/; keepers get copied in as loot.wav/window.wav). loot.wav = the fantasy
 --        harp; window.wav = twonote for now (swap when AL picks).
+-- v0.37: Zone Watch - badge + hover list of non-group players in the zone (a name-set that excludes
+--        self + group, so solo is counted correctly), and a warn() + intruder.wav chime when a NEW
+--        player enters. First scan after load/zone-change adopts silently (no spam). Toggle on the
+--        zone-watch line; alert sound rides the global Sound toggle.
 
 local mq    = require('mq')
 local imgui = require('ImGui')
 
-local VERSION  = '0.36'
+local VERSION  = '0.37'
 local myServer = mq.TLO.EverQuest.Server() or ""
 
 local function serverSlug()
@@ -132,7 +136,7 @@ local GLOBAL_RESPAWN = 20 * 60   -- neutral fallback when zone unknown; observat
 local SPOT_RADIUS_DEFAULT = 30   -- units around a named's captured loc counted as "the spot"
 local PH_THRESHOLD        = 2    -- distinct spawns on the spot before a mob is learned as a PH
 
--- Achievement objective name -> in-game spawn name corrections (from HunterHUD by kaen01)
+-- Achievement objective name -> in-game spawn name corrections
 local nameMap = {
     ["Pli Xin Liako"]           = "Pli Xin Laiko",
     ["Xetheg, Luclin's Warder"] = "Xetheg, Luclin`s Warder",
@@ -140,7 +144,7 @@ local nameMap = {
     ["Ol' Grinnin' Finley"]     = "Ol` Grinnin` Finley",
 }
 
--- Zone ID -> achievement ID where the name lookup fails (from HunterHUD by kaen01)
+-- Zone ID -> achievement ID where the name lookup fails
 local zoneMap = {
     [58]  = 105880,  [66]  = 106680,  [73]  = 107380,  [81]  = 258180,
     [87]  = 208780,  [89]  = 208980,  [108] = 250880,  [207] = 520780,
@@ -367,10 +371,16 @@ end
 -- Alerts / sounds
 
 local soundOn = true
+-- Zone Watch: alert + badge for non-group players in the zone.
+local zoneWatch       = true   -- feature toggle (zone-watch line); badge + alerts off when false
+local zonePcs         = {}     -- last-seen set of other-player names, for the new-arrival diff
+local zonePcsList     = {}     -- {name, level, class, guild} for the hover tooltip
+local zonePcsBaseline = false  -- first scan after load/zone-change adopts silently (no alert spam)
 -- Per-event sounds (swap the filenames to any WAV in assets/sounds/).
 local SOUND_DIR  = (((mq.luaDir or '') .. '/croakwatch/assets/sounds/'):gsub('\\', '/'))
 local WINDOW_WAV = 'window.wav'   -- stable name: swap the file's CONTENTS to change the sound (no orphans)
 local LOOT_WAV   = 'loot.wav'     -- "
+local INTRUDER_WAV = 'intruder.wav'   -- a new non-group player entered the zone
 local TTS_PLUGIN = 'MQTextToSpeech'
 -- Common Windows voices. The plugin substring-matches (so "Zira" -> "Microsoft Zira") and doesn't
 -- expose the installed list to scripts, so this is a curated set; users with others use /tts voice.
@@ -638,6 +648,44 @@ local function checkAlerts()
             end
         end
     end
+end
+
+-- Zone Watch: who else is here. Build the set of players minus self + group (a name-set so solo is
+-- counted correctly), diff against last poll, and alert each NEW arrival. The first scan after load
+-- or a zone change adopts the current crowd silently so it doesn't spam on entry.
+local function pollZonePcs()
+    if not zoneWatch then zonePcs, zonePcsList = {}, {}; return end
+    local myName = mq.TLO.Me.CleanName() or ""
+    local grp = {}
+    if mq.TLO.Group() ~= nil then
+        for i = 0, mq.TLO.Group.Members() do
+            local m = mq.TLO.Group.Member(i)
+            local n = m and m.CleanName() or nil
+            if n then grp[n] = true end
+        end
+    end
+    local now, list = {}, {}
+    for i = 1, (mq.TLO.SpawnCount('pc')() or 0) do
+        local sp = mq.TLO.NearestSpawn(i, 'pc')
+        local n  = sp() ~= nil and sp.CleanName() or nil
+        if n and n ~= myName and not grp[n] then
+            now[n] = true
+            list[#list + 1] = { name = n, level = sp.Level() or 0,
+                                class = sp.Class.ShortName() or "?", guild = sp.Guild() or "" }
+        end
+    end
+    if zonePcsBaseline then
+        for _, p in ipairs(list) do
+            if not zonePcs[p.name] then
+                warn(string.format("%s (%d %s)%s entered the zone", p.name, p.level, p.class,
+                    p.guild ~= "" and (" <" .. p.guild .. ">") or ""))
+                playWav(INTRUDER_WAV)
+            end
+        end
+    else
+        zonePcsBaseline = true
+    end
+    zonePcs, zonePcsList = now, list
 end
 
 -- UI
@@ -965,6 +1013,25 @@ local function renderMain()
     imgui.SameLine(imgui.GetWindowWidth() - minW - imgui.GetStyle().FramePadding.x * 2)
     if imgui.SmallButton("_") then minimized = true end
     imgui.TextDisabled(string.format("%s  -  %s", mq.TLO.Zone.Name() or "?", myServer ~= "" and myServer or "?"))
+    zoneWatch = imgui.Checkbox("##zonewatch", zoneWatch)
+    if imgui.IsItemHovered() then imgui.SetTooltip("Zone watch - alert when non-group players enter the zone") end
+    imgui.SameLine()
+    if zoneWatch then
+        local n = #zonePcsList
+        if n == 0 then imgui.TextColored(0.42, 0.39, 0.50, 1, "zone clear")
+        elseif n <= 4 then imgui.TextColored(0.91, 0.72, 0.31, 1, string.format("%d in zone", n))
+        else imgui.TextColored(0.88, 0.35, 0.30, 1, string.format("%d in zone", n)) end
+        if imgui.IsItemHovered() and n > 0 then
+            imgui.BeginTooltip()
+            for _, p in ipairs(zonePcsList) do
+                imgui.Text(string.format("%s [%d %s]  %s", p.name, p.level, p.class,
+                    p.guild ~= "" and ("<" .. p.guild .. ">") or "no guild"))
+            end
+            imgui.EndTooltip()
+        end
+    else
+        imgui.TextDisabled("zone watch off")
+    end
     imgui.Separator()
 
     imgui.TextDisabled("Show:"); imgui.SameLine()
@@ -1079,12 +1146,14 @@ while running do
         refreshAch()
         if curAchID then loadFromAchievement(true) end
         rosterRebuild()
+        zonePcs, zonePcsList, zonePcsBaseline = {}, {}, false   -- re-adopt the new zone's crowd silently
         lastZone = z
     end
     mq.doevents()
     if not paused then   -- guard clause: skip the work, keep the loop (and UI) alive
         pollSpawns()
         checkAlerts()
+        pollZonePcs()
         tick = tick + 1
         if tick % 6 == 0 then refreshAchDone() end
     end

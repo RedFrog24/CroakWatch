@@ -110,12 +110,14 @@
 --        tells) in-memory (last 150 lines, clears on restart). Header blinks while unread (even
 --        collapsed); expanding acknowledges. campwatch.wav chime (toggle): tells always ring,
 --        OOC throttled to cut spam, intruder keeps its own sound. Self-tells filtered (EMU echo).
+-- v0.39: Themed the roster list scrollbar - rounded grab (ScrollbarRounding) + purple matching the
+--        buttons (ScrollbarGrab/Hovered/Active), added to pushTheme.
 
 local mq    = require('mq')
 local imgui = require('ImGui')
 local Icons = require('mq.Icons')
 
-local VERSION  = '0.38'
+local VERSION  = '0.39'
 local myServer = mq.TLO.EverQuest.Server() or ""
 
 local function serverSlug()
@@ -758,12 +760,17 @@ local function pushTheme()
     imgui.PushStyleColor(ImGuiCol.CheckMark,       0.85, 0.70, 0.32, 1)
     imgui.PushStyleColor(ImGuiCol.Separator,       0.50, 0.40, 0.22, 0.5)
     imgui.PushStyleColor(ImGuiCol.ChildBg,         0.05, 0.04, 0.09, 1)
+    imgui.PushStyleColor(ImGuiCol.ScrollbarBg,         0.08, 0.06, 0.13, 0.6)
+    imgui.PushStyleColor(ImGuiCol.ScrollbarGrab,       0.24, 0.18, 0.40, 0.9)   -- = Button
+    imgui.PushStyleColor(ImGuiCol.ScrollbarGrabHovered, 0.42, 0.31, 0.66, 1)    -- = ButtonHovered
+    imgui.PushStyleColor(ImGuiCol.ScrollbarGrabActive,  0.52, 0.40, 0.78, 1)    -- = ButtonActive
     imgui.PushStyleVar(ImGuiStyleVar.WindowRounding, 9)
     imgui.PushStyleVar(ImGuiStyleVar.ChildRounding,  6)
     imgui.PushStyleVar(ImGuiStyleVar.FrameRounding,  5)
     imgui.PushStyleVar(ImGuiStyleVar.GrabRounding,   4)
     imgui.PushStyleVar(ImGuiStyleVar.FrameBorderSize, 1)
-    return 14, 5
+    imgui.PushStyleVar(ImGuiStyleVar.ScrollbarRounding, 6)
+    return 18, 6
 end
 
 local function gold(text)

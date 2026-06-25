@@ -116,12 +116,15 @@
 --        instead of an indexed NearestSpawn loop - cleaner + one query per tick (same result).
 -- v0.41: Camp Watch - a Clear button (in the expanded header) wipes the feed, and the feed
 --        auto-clears on zone change (stale OOC/intruder lines from the last camp).
+-- v0.42: First-run polish - loadAll only unpickles if the save file exists (no more harmless MQ
+--        load complaint on first open); clearer empty-list message in a zone with no Hunter
+--        achievement (so it doesn't look broken); a Remove button in the Edit popup.
 
 local mq    = require('mq')
 local imgui = require('ImGui')
 local Icons = require('mq.Icons')
 
-local VERSION  = '0.41'
+local VERSION  = '0.42'
 local myServer = mq.TLO.EverQuest.Server() or ""
 
 local function serverSlug()
@@ -281,7 +284,11 @@ local function saveAll()
 end
 
 local function loadAll()
-    local saved = mq.unpickle(SAVE_FILE, {}) or {}
+    -- Only unpickle if the file exists. On first run it doesn't, and unpickling a missing file makes
+    -- MQ print a harmless load complaint that looks like an error to new users.
+    local saved = {}
+    local f = io.open(SAVE_FILE, "r")
+    if f then f:close(); saved = mq.unpickle(SAVE_FILE, {}) or {} end
     db = {}
     local migrated = false
     if saved.named then
@@ -941,6 +948,18 @@ local function renderRow(e)
         end
         imgui.SameLine()
         if imgui.Button("Cancel##edit") then imgui.CloseCurrentPopup() end
+        imgui.Separator()
+        if not e.manual then
+            imgui.TextDisabled("achievement mob - returns on reload; use Hide to keep it off")
+        end
+        imgui.PushStyleColor(ImGuiCol.Button,        0.45, 0.12, 0.12, 0.9)
+        imgui.PushStyleColor(ImGuiCol.ButtonHovered, 0.65, 0.18, 0.18, 1)
+        if imgui.Button("Remove from list##edit") then
+            db[dbKey(e.zone, e.name)] = nil
+            saveAll(); rosterRebuild()
+            imgui.CloseCurrentPopup()
+        end
+        imgui.PopStyleColor(2)
         imgui.EndPopup()
     end
 
@@ -1159,8 +1178,14 @@ local function renderMain()
         return ra < rb
     end)
     if #vis == 0 then
-        imgui.TextDisabled("  No named to show.")
-        imgui.TextDisabled("  Use 'Load from Achievement' or '+ Add Named'.")
+        if not curAchID and #roster == 0 then
+            imgui.TextColored(0.90, 0.80, 0.40, 1, "  This zone has no Hunter achievement.")
+            imgui.TextDisabled("  That's why the list is empty - CroakWatch is working fine.")
+            imgui.TextDisabled("  Use '+ Add Named' to track a mob here, or go to a Hunter zone.")
+        else
+            imgui.TextDisabled("  No named to show.")
+            imgui.TextDisabled("  Use 'Load from Achievement' or '+ Add Named'.")
+        end
     end
     for _, e in ipairs(vis) do renderRow(e) end
     imgui.EndChild()

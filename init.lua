@@ -119,12 +119,16 @@
 -- v0.42: First-run polish - loadAll only unpickles if the save file exists (no more harmless MQ
 --        load complaint on first open); clearer empty-list message in a zone with no Hunter
 --        achievement (so it doesn't look broken); a Remove button in the Edit popup.
+-- v0.43: Multi-loc + loc-gated kills. e.loc -> e.locs (a named with a CLUSTER of spawn spots banks
+--        each one); pollSpot scans all spots. Kills are credited at the spot (loc-gated), and onKill
+--        skips a named once it has banked locs - so a zone-wide trash mob sharing a PH name can no
+--        longer corrupt the timer. Migrates old single-loc configs (e.loc -> {e.loc}).
 
 local mq    = require('mq')
 local imgui = require('ImGui')
 local Icons = require('mq.Icons')
 
-local VERSION  = '0.42'
+local VERSION  = '0.43'
 local myServer = mq.TLO.EverQuest.Server() or ""
 
 local function serverSlug()
@@ -193,7 +197,7 @@ end
 local function newEntry(name, achName, zone, manual)
     return {
         name = name, achName = achName, zone = zone, manual = manual,
-        ph = {}, override = nil, hidden = false, loc = nil,
+        ph = {}, override = nil, hidden = false, locs = {},
         killTime = nil, whoKilled = nil,
         phKills = 0, namedKills = 0, intervals = {},
         spotRadius = nil, spotIntervals = {}, phCandidates = {}, spotEmptyTime = nil,
@@ -272,7 +276,7 @@ local function saveAll()
     for key, e in pairs(db) do
         out[key] = {
             name = e.name, achName = e.achName, zone = e.zone, manual = e.manual,
-            ph = e.ph, override = e.override, hidden = e.hidden, loc = e.loc,
+            ph = e.ph, override = e.override, hidden = e.hidden, locs = e.locs,
             killTime = e.killTime, whoKilled = e.whoKilled,
             phKills = e.phKills, namedKills = e.namedKills, intervals = e.intervals,
             spotRadius = e.spotRadius, spotIntervals = e.spotIntervals,
@@ -294,6 +298,8 @@ local function loadAll()
     if saved.named then
         for key, e in pairs(saved.named) do
             e.ph            = e.ph or {}
+            e.locs          = e.locs or (e.loc and { e.loc } or {})   -- migrate single loc -> locs list
+            e.loc           = nil
             e.phKills       = e.phKills or 0
             e.namedKills    = e.namedKills or 0
             e.intervals     = e.intervals or {}
@@ -486,11 +492,15 @@ end
 local function onKill(mobName)
     if paused then return end
     for _, e in ipairs(roster) do
-        if mobName == e.name then
-            recordKill(e, true)
-        else
-            for _, ph in ipairs(e.ph) do
-                if mobName == ph then recordKill(e, false) break end
+        -- Located named are owned by the loc-gated spot poll (kills credited there), so name-based
+        -- kills are skipped for them - a zone-wide trash mob sharing a PH name can't corrupt the timer.
+        if #e.locs == 0 then
+            if mobName == e.name then
+                recordKill(e, true)
+            else
+                for _, ph in ipairs(e.ph) do
+                    if mobName == ph then recordKill(e, false) break end
+                end
             end
         end
     end
@@ -531,8 +541,8 @@ local function onLoot(item, looter, corpse)
         local mY, mX = mq.TLO.Me.Y() or 0, mq.TLO.Me.X() or 0
         local bestD = nil
         for _, e in ipairs(hits) do
-            if e.loc then
-                local d = (e.loc.y - mY) ^ 2 + (e.loc.x - mX) ^ 2
+            for _, L in ipairs(e.locs) do
+                local d = (L.y - mY) ^ 2 + (L.x - mX) ^ 2
                 if not bestD or d < bestD then bestD, pick = d, e end
             end
         end
@@ -580,14 +590,26 @@ end)
 
 -- Name-poll: for a named we have NOT located yet. Polls by unique name only to detect it
 -- the first time and capture its loc; once loc exists, pollSpot takes over for that named.
+-- Bank the named's current spot into e.locs if it's a NEW one (multi-loc: a named with a cluster of
+-- spawn points). Guard against a junk read (a just-spawned mob can report 0,0,0 for a frame).
+local function bankLoc(e, sp)
+    local y, x, z = sp.Y(), sp.X(), sp.Z()
+    if not y or not x or (y == 0 and x == 0 and (z or 0) == 0) then return end
+    local r = e.spotRadius or SPOT_RADIUS_DEFAULT
+    for _, L in ipairs(e.locs) do
+        if (L.y - y) ^ 2 + (L.x - x) ^ 2 <= r * r then return end   -- already near a known spot
+    end
+    if #e.locs < 6 then
+        e.locs[#e.locs + 1] = { y = y, x = x, z = z }
+        saveAll()
+    end
+end
+
 local function pollByName(e)
     local sp    = mq.TLO.Spawn(string.format('npc "%s"', e.name))
     local nowUp = sp() ~= nil and (sp.CleanName() or "") == e.name
 
-    if nowUp and not e.loc then
-        e.loc = { y = sp.Y(), x = sp.X(), z = sp.Z() }
-        saveAll()
-    end
+    if nowUp then bankLoc(e, sp) end
 
     if not e.seen then
         e.isUp = nowUp
@@ -625,11 +647,17 @@ local function pollSpot(e)
     local sp = mq.TLO.Spawn(string.format('npc "%s"', e.name))   -- this named, anywhere (unique name)
     if sp() ~= nil then
         occ = e.name
+        bankLoc(e, sp)   -- capture a new cluster spot if he popped somewhere we haven't seen
     else
-        sp = mq.TLO.NearestSpawn(string.format('npc loc %d %d %d radius %d', e.loc.x, e.loc.y, e.loc.z, r))
-        occ = sp() ~= nil and sp.CleanName() or nil
-        if occ then
-            for _, e2 in ipairs(roster) do if e2.name == occ then occ = nil break end end
+        -- aggregate cluster occupant: nearest non-named mob across ALL banked spots
+        for _, L in ipairs(e.locs) do
+            local s2 = mq.TLO.NearestSpawn(string.format('npc loc %d %d %d radius %d', L.x, L.y, L.z, r))
+            local n2 = s2() ~= nil and s2.CleanName() or nil
+            if n2 then
+                local isNamed = false
+                for _, e2 in ipairs(roster) do if e2.name == n2 then isNamed = true break end end
+                if not isNamed then occ, sp = n2, s2; break end
+            end
         end
     end
 
@@ -678,6 +706,8 @@ local function pollSpot(e)
             e.killTime  = os.time()
             e.whoKilled = prev == e.name and "named" or "ph"
             e.alerted   = false
+            -- loc-gated kill credit (onKill skips located named, so count it here at the spot)
+            if prev == e.name then e.namedKills = e.namedKills + 1 else e.phKills = e.phKills + 1 end
         end
         e.spotOccupant = nil
         saveAll()
@@ -686,7 +716,7 @@ end
 
 local function pollSpawns()
     for _, e in ipairs(roster) do
-        if e.loc and e.loc.x then pollSpot(e) else pollByName(e) end
+        if #e.locs > 0 then pollSpot(e) else pollByName(e) end
     end
 end
 
@@ -824,14 +854,16 @@ local function renderRow(e)
     if e.isUp then imgui.SameLine(); imgui.TextColored(0.3, 1.0, 0.3, 1, " [UP]") end
     if e.achDone == true then imgui.SameLine(); imgui.TextColored(0.45, 0.85, 0.45, 1, " done")
     elseif e.achDone == false then imgui.SameLine(); imgui.TextDisabled(" need") end
-    if e.loc then
+    if #e.locs > 0 then
         imgui.SameLine()
         local phConfirmed = #e.ph > 0
-        if phConfirmed then imgui.TextColored(0.40, 0.90, 0.50, 1, " @")   -- loc + PH confirmed
-        else imgui.TextColored(0.55, 0.45, 0.75, 1, " @") end              -- loc only
+        local badge = #e.locs > 1 and string.format(" @x%d", #e.locs) or " @"
+        if phConfirmed then imgui.TextColored(0.40, 0.90, 0.50, 1, badge)   -- loc + PH confirmed
+        else imgui.TextColored(0.55, 0.45, 0.75, 1, badge) end              -- loc only
         if imgui.IsItemHovered() then
-            if phConfirmed then imgui.SetTooltip("Loc banked - PH confirmed: " .. joinCSV(e.ph))
-            else imgui.SetTooltip("Loc banked (no PH confirmed yet)") end
+            local spots = string.format("%d spot%s banked", #e.locs, #e.locs > 1 and "s" or "")
+            if phConfirmed then imgui.SetTooltip(spots .. " - PH confirmed: " .. joinCSV(e.ph))
+            else imgui.SetTooltip(spots .. " (no PH confirmed yet)") end
         end
     end
     if e.hidden then imgui.SameLine(); imgui.TextDisabled(" (hidden)") end

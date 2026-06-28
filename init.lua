@@ -123,12 +123,15 @@
 --        each one); pollSpot scans all spots. Kills are credited at the spot (loc-gated), and onKill
 --        skips a named once it has banked locs - so a zone-wide trash mob sharing a PH name can no
 --        longer corrupt the timer. Migrates old single-loc configs (e.loc -> {e.loc}).
+-- v0.44: CRASH FIX. Stopped unloading MQTextToSpeech on exit - unloading a plugin as the script
+--        terminated crashed the EQ client on X-close (surfaced on EMU, where CW is the one that
+--        loads TTS since it isn't pre-loaded). We now load it if needed and just leave it loaded.
 
 local mq    = require('mq')
 local imgui = require('ImGui')
 local Icons = require('mq.Icons')
 
-local VERSION  = '0.43'
+local VERSION  = '0.44'
 local myServer = mq.TLO.EverQuest.Server() or ""
 
 local function serverSlug()
@@ -417,7 +420,6 @@ local TTS_PLUGIN = 'MQTextToSpeech'
 -- Common Windows voices. The plugin substring-matches (so "Zira" -> "Microsoft Zira") and doesn't
 -- expose the installed list to scripts, so this is a curated set; users with others use /tts voice.
 local TTS_VOICES = { "David", "Zira", "Mark" }
-local ttsLoadedByUs = false
 
 -- /beep <file> plays a WAV async via Windows PlaySound (verified in MQ source). Quote for spaces.
 local function playWav(file)
@@ -1280,11 +1282,11 @@ refreshAch()
 if curAchID then loadFromAchievement(true) end
 rosterRebuild()
 
--- Load TTS for spoken Named alerts; remember if WE loaded it so we can unload on exit.
+-- Load TTS for spoken Named alerts if it isn't already. We do NOT unload it on exit - unloading a
+-- plugin as the script terminates crashed the EQ client (v0.44, EMU where CW was the one to load it).
 if not mq.TLO.Plugin(TTS_PLUGIN).IsLoaded() then
     mq.cmd('/plugin ' .. TTS_PLUGIN)
     mq.delay(500)
-    ttsLoadedByUs = mq.TLO.Plugin(TTS_PLUGIN).IsLoaded()
 end
 
 mq.imgui.init('CroakWatch', renderUI)
@@ -1317,5 +1319,6 @@ while running do
     mq.delay(500)
 end
 
--- Clean up: only unload TTS if we were the ones who loaded it.
-if ttsLoadedByUs then mq.cmd('/plugin ' .. TTS_PLUGIN .. ' unload') end
+-- NOTE: deliberately no plugin unload here. Unloading MQTextToSpeech as the script exits crashed
+-- the EQ client (raced with ImGui/script teardown - hard crash, no error). Leave it loaded; the
+-- user can '/plugin MQTextToSpeech unload' by hand if they want.

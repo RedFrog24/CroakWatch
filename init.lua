@@ -126,12 +126,15 @@
 -- v0.44: CRASH FIX. Stopped unloading MQTextToSpeech on exit - unloading a plugin as the script
 --        terminated crashed the EQ client on X-close (surfaced on EMU, where CW is the one that
 --        loads TTS since it isn't pre-loaded). We now load it if needed and just leave it loaded.
+-- v0.45: Quick-reply. Camp Watch tell/OOC feed lines get a 'reply' button -> pick a preset -> sends
+--        IN KIND (tell -> /tell sender, ooc -> /ooc public). Manual only (no auto-reply). Editable
+--        per-server preset list in a new "Quick Replies" panel (ships a few defaults).
 
 local mq    = require('mq')
 local imgui = require('ImGui')
 local Icons = require('mq.Icons')
 
-local VERSION  = '0.44'
+local VERSION  = '0.45'
 local myServer = mq.TLO.EverQuest.Server() or ""
 
 local function serverSlug()
@@ -186,6 +189,7 @@ local zoneMap = {
 local db           = {}    -- keyed by "zoneShort|inGameName"
 local roster       = {}    -- array of db entries for the current zone (rebuilt on zone change)
 local lootWatch    = {}    -- global per-server list of { item, count }
+local quickReplies = {}    -- per-server preset reply strings (Camp Watch quick-reply)
 local curAchID     = nil
 local curZoneShort = ""
 local running      = true
@@ -287,7 +291,7 @@ local function saveAll()
             loot = e.loot,
         }
     end
-    mq.pickle(SAVE_FILE, { named = out, loot = lootWatch })
+    mq.pickle(SAVE_FILE, { named = out, loot = lootWatch, replies = quickReplies })
 end
 
 local function loadAll()
@@ -325,6 +329,10 @@ local function loadAll()
         end
     end
     lootWatch = saved.loot or {}
+    quickReplies = saved.replies or {
+        "Camp's taken, sorry", "Yes camping here - welcome to join",
+        "Open after my drop", "AFK, back shortly", "Live and camping here",
+    }
     for _, w in ipairs(lootWatch) do w.count = w.count or 0 end
     if migrated then saveAll() end   -- persist the cleanup immediately
 end
@@ -440,8 +448,8 @@ end
 
 -- Camp Watch: append one line to the feed + flag it unread (drives the blink). Sound rules:
 -- intruder ("zone") already plays its own; tells always knock; OOC is throttled to cut spam.
-local function watchPush(kind, text)
-    watchFeed[#watchFeed + 1] = { t = os.date("%H:%M:%S"), kind = kind, text = text }
+local function watchPush(kind, text, who)
+    watchFeed[#watchFeed + 1] = { t = os.date("%H:%M:%S"), kind = kind, text = text, who = who }
     if #watchFeed > 150 then table.remove(watchFeed, 1) end
     watchUnread = true
     watchNewCount = watchNewCount + 1
@@ -581,12 +589,12 @@ end)
 -- OOC/tell strings are verified in-game (the event simply won't fire if a server's format differs).
 mq.event("cw_ooc", "#*# says out of character, #*#", function(line)
     local who, msg = line:match("^(.-) says out of character, '(.*)'")
-    if who and msg then watchPush("ooc", string.format('%s: "%s"', who, msg)) end
+    if who and msg then watchPush("ooc", string.format('%s: "%s"', who, msg), who) end
 end)
 mq.event("cw_tell", "#*# tells you, #*#", function(line)
     local who, msg = line:match("^(.-) tells you, '(.*)'")
     if who and msg and who ~= (mq.TLO.Me.CleanName() or "") then   -- drop self-tells (EMU echo)
-        watchPush("tell", string.format('%s: "%s"', who, msg))
+        watchPush("tell", string.format('%s: "%s"', who, msg), who)
     end
 end)
 
@@ -782,6 +790,7 @@ local filterMode = 0          -- 0 all, 1 up, 2 need
 local showHidden = false
 local lootInput  = ""
 local voiceInput = ""
+local replyInput = ""
 
 local addName, addPH, addOverride = "", "", 0
 local editOverride, editPH, editHidden, editSpotRadius = 0, "", false, 0
@@ -1093,6 +1102,24 @@ local function renderSoundTest()
     end
 end
 
+-- Quick Replies: editable canned messages used by the Camp Watch feed's 'reply' button (reply in kind).
+local function renderQuickReplies()
+    if not imgui.CollapsingHeader("Quick Replies") then return end
+    imgui.TextDisabled("  Sent by 'reply' in the Camp Watch feed (tell -> tell, ooc -> ooc).")
+    for i = #quickReplies, 1, -1 do
+        imgui.PushID(i)
+        if imgui.SmallButton("X") then table.remove(quickReplies, i); saveAll() end
+        imgui.SameLine(); imgui.TextWrapped(quickReplies[i])
+        imgui.PopID()
+    end
+    imgui.SetNextItemWidth(220)
+    replyInput = imgui.InputText("##qrin", replyInput, 128)
+    imgui.SameLine()
+    if imgui.SmallButton("Add##qr") and replyInput ~= "" then
+        quickReplies[#quickReplies + 1] = replyInput; replyInput = ""; saveAll()
+    end
+end
+
 -- Camp Watch footer: blinking header (pulses even when collapsed) + the unified feed. Clicking the
 -- header toggles + acknowledges (stops the blink). A camp-safety glance for AFK.
 local function renderCampWatch()
@@ -1126,12 +1153,27 @@ local function renderCampWatch()
         if #watchFeed == 0 then imgui.TextDisabled("  (quiet - nothing yet)") end
         for i = #watchFeed, 1, -1 do
             local e = watchFeed[i]
+            imgui.PushID(i)
+            if (e.kind == "tell" or e.kind == "ooc") and #quickReplies > 0 then
+                if imgui.SmallButton("reply") then imgui.OpenPopup("qr") end
+                if imgui.BeginPopup("qr") then       -- pick a preset; replies in kind, auto-closes
+                    for _, msg in ipairs(quickReplies) do
+                        if imgui.Selectable(msg) then
+                            if e.kind == "tell" and e.who then mq.cmdf('/tell %s %s', e.who, msg)
+                            elseif e.kind == "ooc" then mq.cmdf('/ooc %s', msg) end
+                        end
+                    end
+                    imgui.EndPopup()
+                end
+                imgui.SameLine()
+            end
             local r, g, b = 0.34, 0.78, 0.78
             if e.kind == "tell" then r, g, b = 0.42, 0.80, 0.37
             elseif e.kind == "zone" then r, g, b = 0.91, 0.72, 0.31 end
             imgui.PushStyleColor(ImGuiCol.Text, r, g, b, 1)
             imgui.TextWrapped(string.format("[%s] %s  %s", e.t, e.kind, e.text))
             imgui.PopStyleColor()
+            imgui.PopID()
         end
         imgui.EndChild()
     end
@@ -1193,6 +1235,7 @@ local function renderMain()
 
     renderLootWatch()
     renderSoundTest()
+    renderQuickReplies()
     imgui.Separator()
 
     imgui.BeginChild("##list", 0, -(imgui.GetFrameHeightWithSpacing() * 2 + 14 + (watchOpen and 130 or 0)), true)

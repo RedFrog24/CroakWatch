@@ -129,12 +129,54 @@
 -- v0.45: Quick-reply. Camp Watch tell/OOC feed lines get a 'reply' button -> pick a preset -> sends
 --        IN KIND (tell -> /tell sender, ooc -> /ooc public). Manual only (no auto-reply). Editable
 --        per-server preset list in a new "Quick Replies" panel (ships a few defaults).
+-- v0.46: GUI practice step - no native title bar (NoTitleBar) + our own X (stops) and _ (mini) in a
+--        custom header. First taste of the Unity-style custom chrome. Local feel-test, not released.
+-- v0.47: Locked window width to 520 (Unity-style); height stays resizable so the roster scrolls.
+--        Local feel-test, not released.
+-- v0.48: GUI practice - real tab bar (Camps/Timers/Loot/Stats/Notes/Options). Camps/Loot/Stats/
+--        Options hold real content (roster, Loot Watch, quick stats, Sounds+Quick Replies);
+--        Timers/Notes are honest "coming" placeholders. Camp Watch footer pinned below the tabs.
+-- v0.49: GUI practice - inline FA icons on the tabs (map-marker/hourglass/diamond/bar-chart/book/
+--        cog; verified present in mq/Icons.lua, nil-guarded). Fantasy-leaning per AL (hourglass).
+-- v0.50: Camps tab icon -> FA_FIRE (campfire) per AL.
+-- v0.51: Moved both sound toggles (master Sound + Camp Watch sound) into Options > Sounds; removed
+--        them from the Show row + the Camp Watch footer (Clear button shifts to the right edge).
+-- v0.52: Camps tab icon -> FA_PAW per AL.
+-- v0.53: Sounds UI - the Camp Watch sound box now shows unchecked + ignores clicks while master
+--        Sound is off (so master-off reads as "both off"); watchSound preference restored when on.
+-- v0.54: Zone Watch - clicking the "N in zone" badge opens a PINNED, scrollable player list (a
+--        tooltip can't be scrolled - dies in PoK with 80+). Hover tooltip kept but capped at 15.
+-- v0.55: Zone Watch pinned list - Name (alpha) / Level (high-first, name tiebreak) sort radios.
+-- v0.56: Timers tab built - a dense "who pops soon" board. Camps with a running clock (or UP)
+--        get a one-line name + countdown bar, sorted soonest-due (reuses sortKey + the v0.25 bar);
+--        not-yet-timed camps collapse to a single muted "+N" line. Glance-only, no buttons.
+-- v0.57: Camps row no longer draws the stale "** WINDOW OPEN **" countdown line on a mob that's
+--        currently UP (it contradicted the [UP] tag) - matches the Timers tab, which already skips
+--        the bar when UP. Trust badge + "killed X ago" still show.
+-- v0.58: TEMP DIAGNOSTIC (not a real release) - SPOT_DEBUG echoes each pollSpot transition
+--        (prev -> occ) + every spot-kill, to confirm whether dense HH camps ever read the spot
+--        EMPTY (the only path that currently records a located-mob kill). Remove SPOT_DEBUG after.
+-- v0.59: FROZEN-TIMER FIX. pollSpot now takes NAMED timing from the named's own unique-name
+--        up->down (a unique name can't oscillate like "nearest mob" in a crowded room - the v0.58
+--        diagnostic showed dense camps never read the spot EMPTY, so named kills were never
+--        recorded). The spot occupant now drives ONLY PH discovery + the best-effort spot clock,
+--        and only while the named is down; it no longer saves on PH<->PH flips (kills the churn).
+--        Plus a cosmetic 3x-respawn stale guard: a days-old kill stops flashing "WINDOW OPEN" /
+--        re-alarming on load (shows "window long open"). SPOT_DEBUG still ON to verify the fix.
+-- v0.60: removed the SPOT_DEBUG diagnostic + all [CWDBG] echoes (frozen-timer fix confirmed in
+--        field - named kills now register even with a PH instantly on the spot).
+-- v0.61: respawn now means THE NAMED. Placeholder kills no longer touch killTime/intervals, so
+--        killTime is purely the named's last death and the learned interval is clean named->death->
+--        death. respawnFor drops the spot-cycle rung (it was the fast PH cadence -> the bogus "1m");
+--        order is now override > named kill->kill (>=3) > zone default > fallback. Spot-cycle is
+--        still measured but is a placeholder stat, not the named's timer. One-time migration
+--        (schema 61): clears old intervals/spotIntervals (they were PH-polluted) to relearn clean.
 
 local mq    = require('mq')
 local imgui = require('ImGui')
 local Icons = require('mq.Icons')
 
-local VERSION  = '0.45'
+local VERSION  = '0.61'
 local myServer = mq.TLO.EverQuest.Server() or ""
 
 local function serverSlug()
@@ -263,13 +305,12 @@ end
 local function info(msg) print(string.format("\ao[\agCroakWatch\ao]\at %s\ax", msg)) end
 local function warn(msg) print(string.format("\ao[\ayCroakWatch\ao]\at %s\ax", msg)) end
 
--- Resolution chain: override > spot-cycle (>=3) > kill->kill observed (>=3) > zone default
--- > global fallback. Spot-cycle (empty->occupied) outranks kill->kill because it's the true
--- repop, free of your kill time. Returns seconds + a source label for the trust badge.
+-- Resolution chain (v0.61): override > named kill->kill observed (>=3) > zone default > global
+-- fallback. The spot-cycle was DROPPED here - in a crowded room it measures the fast placeholder
+-- cadence, not the named's respawn (it gave the bogus "1m"). The named's own death->death is now
+-- the learned source. Returns seconds + a source label for the trust badge.
 local function respawnFor(e)
     if e.override and e.override > 0 then return e.override, "override" end
-    local spot = observedAvg(e.spotIntervals)
-    if spot then return spot, "spot" end
     local obs = observedAvg(e.intervals)
     if obs then return obs, "observed" end
     if ZONE_RESPAWN[e.zone] then return ZONE_RESPAWN[e.zone], "default" end
@@ -291,7 +332,7 @@ local function saveAll()
             loot = e.loot,
         }
     end
-    mq.pickle(SAVE_FILE, { named = out, loot = lootWatch, replies = quickReplies })
+    mq.pickle(SAVE_FILE, { named = out, loot = lootWatch, replies = quickReplies, schema = 61 })
 end
 
 local function loadAll()
@@ -302,6 +343,7 @@ local function loadAll()
     if f then f:close(); saved = mq.unpickle(SAVE_FILE, {}) or {} end
     db = {}
     local migrated = false
+    local oldSchema = saved.schema or 0
     if saved.named then
         for key, e in pairs(saved.named) do
             e.ph            = e.ph or {}
@@ -325,6 +367,7 @@ local function loadAll()
                 e.loot[r[1]] = nil
                 migrated = true
             end
+            if oldSchema < 61 then e.intervals, e.spotIntervals = {}, {} end   -- v0.61: drop PH-polluted samples, relearn clean
             db[key] = e
         end
     end
@@ -334,6 +377,7 @@ local function loadAll()
         "Open after my drop", "AFK, back shortly", "Live and camping here",
     }
     for _, w in ipairs(lootWatch) do w.count = w.count or 0 end
+    if oldSchema < 61 then migrated = true end   -- stamp schema=61 so the v0.61 interval reset runs once
     if migrated then saveAll() end   -- persist the cleanup immediately
 end
 
@@ -480,21 +524,26 @@ local soundFiles = listSounds()
 -- Kill + loot detection
 
 local function recordKill(e, isNamed)
+    if not isNamed then
+        -- v0.61: a placeholder kill feeds the COUNT only. It must not touch killTime or intervals -
+        -- the named's clock is named death->death, free of the fast placeholder cadence.
+        e.phKills = e.phKills + 1
+        saveAll()
+        return
+    end
     if e.killTime then
-        local iv = os.time() - e.killTime   -- kill->kill = spot repop (active camp = killed on sight)
+        local iv = os.time() - e.killTime   -- named death->death = the true named respawn (killTime is named-only now)
         if iv >= 60 and iv <= 2400 then
             e.intervals[#e.intervals + 1] = iv
             if #e.intervals > 10 then table.remove(e.intervals, 1) end
         end
     end
-    e.killTime  = os.time()
-    e.whoKilled = isNamed and "named" or "ph"
-    e.alerted   = false
-    if isNamed then e.namedKills = e.namedKills + 1
-    else e.phKills = e.phKills + 1 end
+    e.killTime   = os.time()
+    e.whoKilled  = "named"
+    e.alerted    = false
+    e.namedKills = e.namedKills + 1
     if not e.hidden then
-        info(string.format("%s %s down - respawn ~%s",
-            e.name, isNamed and "\ag[NAMED]\at" or "[PH]", fmtDur((respawnFor(e)))))
+        info(string.format("%s \ag[NAMED]\at down - respawn ~%s", e.name, fmtDur((respawnFor(e)))))
     end
     saveAll()
 end
@@ -641,87 +690,88 @@ local function pollByName(e)
     end
 end
 
--- Spot-poll: watch WHAT IS ON THE SPOT, not the named's name. The nearest npc within
--- spotRadius of the captured loc is the occupant. Empty->occupied = a repop (measures the
--- true respawn clock). An occupant that isn't the named is a PH candidate, learned after
--- PH_THRESHOLD distinct spawns. NOTE: MQ spawn-search loc is ordered X Y Z (opposite of our
--- stored y,x,z); radius is required.
+-- Spot-poll (v0.59 split): NAMED TIMING comes from the named's own unique-name up->down (a unique
+-- name can't oscillate like "nearest mob" does in a crowded room - that was the frozen-timer bug).
+-- The spot occupant is used ONLY for PH discovery + the best-effort spot-cycle clock, and only while
+-- the named is down. NOTE: MQ spawn-search loc is ordered X Y Z (opposite of our stored y,x,z);
+-- radius is required.
 local function pollSpot(e)
-    local r   = e.spotRadius or SPOT_RADIUS_DEFAULT
-    -- Who's on the spot? Check THIS named by its (unique) name first - unambiguous even when a
-    -- neighbouring named shares the room (NearestSpawn returns whoever's nearer to YOU, which could
-    -- be the neighbour). If our named isn't up, the nearest mob at the spot that ISN'T a roster
-    -- named is a PH; a neighbouring named is ignored (spot reads empty) so it pollutes neither PH
-    -- discovery nor the spot-cycle clock. PHs are generic trash, never named.
-    local occ
-    local sp = mq.TLO.Spawn(string.format('npc "%s"', e.name))   -- this named, anywhere (unique name)
-    if sp() ~= nil then
-        occ = e.name
-        bankLoc(e, sp)   -- capture a new cluster spot if he popped somewhere we haven't seen
-    else
-        -- aggregate cluster occupant: nearest non-named mob across ALL banked spots
-        for _, L in ipairs(e.locs) do
-            local s2 = mq.TLO.NearestSpawn(string.format('npc loc %d %d %d radius %d', L.x, L.y, L.z, r))
-            local n2 = s2() ~= nil and s2.CleanName() or nil
-            if n2 then
-                local isNamed = false
-                for _, e2 in ipairs(roster) do if e2.name == n2 then isNamed = true break end end
-                if not isNamed then occ, sp = n2, s2; break end
-            end
-        end
-    end
+    local r = e.spotRadius or SPOT_RADIUS_DEFAULT
+
+    -- Reliable signal: is THIS named (unique name) present anywhere in zone?
+    local sp = mq.TLO.Spawn(string.format('npc "%s"', e.name))
+    local namedUp = sp() ~= nil
+    if namedUp then bankLoc(e, sp) end
 
     if not e.spotSeen then   -- first pass: adopt current state silently (no load-time alert)
-        e.spotSeen, e.spotOccupant, e.isUp = true, occ, occ == e.name
+        e.spotSeen, e.isUp, e.spotOccupant = true, namedUp, nil
         return
     end
 
+    if namedUp and not e.isUp then            -- named just came UP
+        if not e.hidden then
+            local where = string.format("(%dm %s)", math.floor(sp.Distance() or 0), sp.HeadingTo.ShortName() or "?")
+            info(string.format("\ag** %s IS UP **\at  %s", e.name, where))
+            namedUpAlert(e.name, where)
+        end
+        e.isUp, e.alerted = true, true
+        e.spotOccupant, e.spotEmptyTime = nil, nil
+    elseif not namedUp and e.isUp then        -- named just went DOWN = killed (active camp)
+        e.isUp = false
+        if not e.killTime or os.time() - e.killTime > 30 then
+            recordKill(e, true)               -- credit + start clock, regardless of what's on the spot
+        end
+    end
+
+    if namedUp then return end                -- named is here; PH/spot tracking runs only while it's down
+
+    -- PH discovery + best-effort spot-cycle clock. Nearest non-named occupant across banked spots.
+    local occ
+    for _, L in ipairs(e.locs) do
+        local s2 = mq.TLO.NearestSpawn(string.format('npc loc %d %d %d radius %d', L.x, L.y, L.z, r))
+        local n2 = s2() ~= nil and s2.CleanName() or nil
+        if n2 then
+            local named = false
+            for _, e2 in ipairs(roster) do if e2.name == n2 then named = true break end end
+            if not named then occ = n2; break end
+        end
+    end
+
     local prev = e.spotOccupant
-    if occ and occ ~= prev then
-        if prev == nil and e.spotEmptyTime then   -- empty->occupied = a measured repop
+    if occ == prev then return end            -- no transition: do nothing, DON'T save (kills the churn)
+
+    local changed = false
+    if occ ~= nil then
+        if prev == nil and e.spotEmptyTime then   -- empty->occupied = a measured PH repop
             local iv = os.time() - e.spotEmptyTime
             if iv >= 60 and iv <= 2400 then
                 e.spotIntervals[#e.spotIntervals + 1] = iv
                 if #e.spotIntervals > 10 then table.remove(e.spotIntervals, 1) end
+                changed = true
             end
         end
         e.spotEmptyTime = nil
-        if occ == e.name then
-            if not e.isUp and not e.hidden then
-                local where = string.format("(%dm %s)", math.floor(sp.Distance() or 0), sp.HeadingTo.ShortName() or "?")
-                info(string.format("\ag** %s IS UP **\at  %s", e.name, where))
-                namedUpAlert(e.name, where)
-            end
-            e.isUp, e.alerted = true, true
-        else
-            e.isUp = false   -- occ here is a generic mob (neighbour named already nil'd above)
-            local known = false
-            for _, ph in ipairs(e.ph) do if ph == occ then known = true break end end
-            if not known then
-                e.phCandidates[occ] = (e.phCandidates[occ] or 0) + 1
-                if e.phCandidates[occ] >= PH_THRESHOLD then
-                    e.ph[#e.ph + 1] = occ
-                    e.phCandidates[occ] = nil
-                    if not e.hidden then
-                        info(string.format("\ag[PH discovered]\at %s is a placeholder for \ap%s", occ, e.name))
-                    end
+        local known = false
+        for _, ph in ipairs(e.ph) do if ph == occ then known = true break end end
+        if not known then
+            e.phCandidates[occ] = (e.phCandidates[occ] or 0) + 1   -- transient: not saved until it learns
+            if e.phCandidates[occ] >= PH_THRESHOLD then
+                e.ph[#e.ph + 1] = occ
+                e.phCandidates[occ] = nil
+                changed = true
+                if not e.hidden then
+                    info(string.format("\ag[PH discovered]\at %s is a placeholder for \ap%s", occ, e.name))
                 end
             end
         end
-        e.spotOccupant = occ
-        saveAll()
-    elseif occ == nil and prev ~= nil then   -- occupied->empty = the spot cleared (killed)
-        e.spotEmptyTime, e.isUp = os.time(), false
-        if not e.killTime or os.time() - e.killTime > 30 then
-            e.killTime  = os.time()
-            e.whoKilled = prev == e.name and "named" or "ph"
-            e.alerted   = false
-            -- loc-gated kill credit (onKill skips located named, so count it here at the spot)
-            if prev == e.name then e.namedKills = e.namedKills + 1 else e.phKills = e.phKills + 1 end
-        end
-        e.spotOccupant = nil
-        saveAll()
+    else                                      -- occ == nil: spot cleared = a placeholder was killed
+        e.spotEmptyTime = os.time()
+        e.phKills = e.phKills + 1             -- count only; a PH kill must NOT touch the named's clock (v0.61)
+        changed = true
     end
+
+    e.spotOccupant = occ
+    if changed then saveAll() end
 end
 
 local function pollSpawns()
@@ -733,7 +783,11 @@ end
 local function checkAlerts()
     for _, e in ipairs(roster) do
         if e.killTime and not e.alerted and not e.isUp then
-            if os.time() - e.killTime >= (respawnFor(e)) then
+            local rs = respawnFor(e)
+            local el = os.time() - e.killTime
+            if el >= rs * 3 then
+                e.alerted = true   -- stale (e.g. days-old kill on load): mark done, but DON'T alarm
+            elseif el >= rs then
                 e.alerted = true
                 if not e.hidden then
                     info(string.format("\ao%s - spawn window open", e.name))
@@ -791,6 +845,7 @@ local showHidden = false
 local lootInput  = ""
 local voiceInput = ""
 local replyInput = ""
+local zonePcsSort = "name"   -- pinned zone-players list sort: "name" (alpha) or "level"
 
 local addName, addPH, addOverride = "", "", 0
 local editOverride, editPH, editHidden, editSpotRadius = 0, "", false, 0
@@ -882,33 +937,37 @@ local function renderRow(e)
     trustBadge(e)
 
     if e.killTime then
-        local rs        = (respawnFor(e))
-        local elapsed   = os.time() - e.killTime
-        local remaining = rs - elapsed
-        if remaining > 0 then
-            local pct = remaining / rs
-            local r, g, b
-            if pct > 0.5 then r, g, b = 1.0, 0.3, 0.3
-            elseif pct > 0.2 then r, g, b = 1.0, 0.85, 0.2
-            else r, g, b = 0.3, 1.0, 0.3 end
-            local barH   = imgui.GetFrameHeight()                   -- font + padding: fits text (was 14, clipped)
-            local barPos = imgui.GetCursorScreenPosVec()            -- top-left before drawing (Vec = ImVec2)
-            local barW   = imgui.GetContentRegionAvailVec().x       -- ProgressBar(-1) fills this width
-            imgui.PushStyleColor(ImGuiCol.PlotHistogram, r, g, b, 0.85)
-            imgui.ProgressBar(math.min(1.0, elapsed / rs), -1, barH, "")   -- no built-in overlay
-            imgui.PopStyleColor()
-            -- draw the label ourselves with a shadow so white stays readable over the bright fill
-            local label = fmtClock(remaining) .. " until window"
-            local ts = imgui.CalcTextSizeVec(label)
-            local lx = barPos.x + (barW - ts.x) * 0.5
-            local ly = barPos.y + (barH - ts.y) * 0.5
-            local dl = imgui.GetWindowDrawList()
-            dl:AddText(ImVec2(lx + 1, ly + 1), IM_COL32(0, 0, 0, 220), label)
-            dl:AddText(ImVec2(lx, ly), IM_COL32(255, 255, 255, 255), label)
-        else
-            local flash = (math.floor(mq.gettime() / 500) % 2 == 0)
-            local lbl   = string.format("  ** WINDOW OPEN **  (%s past)", fmtClock(-remaining))
-            if flash then imgui.TextColored(0.3, 1.0, 0.3, 1, lbl) else imgui.TextColored(0.4, 0.4, 0.4, 0.5, lbl) end
+        local elapsed = os.time() - e.killTime
+        if not e.isUp then   -- UP mob is here NOW, so the respawn bar / "window open" line is stale - skip it
+            local rs        = (respawnFor(e))
+            local remaining = rs - elapsed
+            if remaining > 0 then
+                local pct = remaining / rs
+                local r, g, b
+                if pct > 0.5 then r, g, b = 1.0, 0.3, 0.3
+                elseif pct > 0.2 then r, g, b = 1.0, 0.85, 0.2
+                else r, g, b = 0.3, 1.0, 0.3 end
+                local barH   = imgui.GetFrameHeight()                   -- font + padding: fits text (was 14, clipped)
+                local barPos = imgui.GetCursorScreenPosVec()            -- top-left before drawing (Vec = ImVec2)
+                local barW   = imgui.GetContentRegionAvailVec().x       -- ProgressBar(-1) fills this width
+                imgui.PushStyleColor(ImGuiCol.PlotHistogram, r, g, b, 0.85)
+                imgui.ProgressBar(math.min(1.0, elapsed / rs), -1, barH, "")   -- no built-in overlay
+                imgui.PopStyleColor()
+                -- draw the label ourselves with a shadow so white stays readable over the bright fill
+                local label = fmtClock(remaining) .. " until window"
+                local ts = imgui.CalcTextSizeVec(label)
+                local lx = barPos.x + (barW - ts.x) * 0.5
+                local ly = barPos.y + (barH - ts.y) * 0.5
+                local dl = imgui.GetWindowDrawList()
+                dl:AddText(ImVec2(lx + 1, ly + 1), IM_COL32(0, 0, 0, 220), label)
+                dl:AddText(ImVec2(lx, ly), IM_COL32(255, 255, 255, 255), label)
+            elseif elapsed > rs * 3 then   -- window blown so long the number is meaningless - mute it
+                imgui.TextDisabled(string.format("    window long open (%s)", fmtElapsed(elapsed)))
+            else
+                local flash = (math.floor(mq.gettime() / 500) % 2 == 0)
+                local lbl   = string.format("  ** WINDOW OPEN **  (%s past)", fmtClock(-remaining))
+                if flash then imgui.TextColored(0.3, 1.0, 0.3, 1, lbl) else imgui.TextColored(0.4, 0.4, 0.4, 0.5, lbl) end
+            end
         end
         imgui.TextDisabled(string.format("    %s killed %s", e.whoKilled or "mob", fmtElapsed(elapsed)))
     else
@@ -1044,7 +1103,6 @@ local function renderAddPopup()
 end
 
 local function renderLootWatch()
-    if not imgui.CollapsingHeader("Loot Watch") then return end
     for i = #lootWatch, 1, -1 do
         local w = lootWatch[i]
         imgui.PushID(i)
@@ -1069,7 +1127,6 @@ end
 
 -- Audition every WAV in assets/sounds/ in-game. (Future home: the OPTIONS tab.)
 local function renderSoundTest()
-    if not imgui.CollapsingHeader("Sound Test") then return end
     local ttsOk = mq.TLO.Plugin(TTS_PLUGIN).IsLoaded()
     if imgui.SmallButton("Test Voice") then
         local sample = (roster[1] and roster[1].name) or "Frenzied Ghoul"   -- demo the real "<name> is up"
@@ -1104,7 +1161,6 @@ end
 
 -- Quick Replies: editable canned messages used by the Camp Watch feed's 'reply' button (reply in kind).
 local function renderQuickReplies()
-    if not imgui.CollapsingHeader("Quick Replies") then return end
     imgui.TextDisabled("  Sent by 'reply' in the Camp Watch feed (tell -> tell, ooc -> ooc).")
     for i = #quickReplies, 1, -1 do
         imgui.PushID(i)
@@ -1137,17 +1193,10 @@ local function renderCampWatch()
         watchOpen = not watchOpen
         if watchOpen then watchUnread = false; watchNewCount = 0 end
     end
-    if watchOpen then
-        imgui.SameLine(imgui.GetWindowWidth() - 92)
+    if watchOpen then   -- Camp Watch sound toggle moved to Options > Sounds
+        imgui.SameLine(imgui.GetWindowWidth() - 64)
         if imgui.SmallButton("Clear") then watchFeed, watchUnread, watchNewCount = {}, false, 0 end
     end
-    imgui.SameLine(imgui.GetWindowWidth() - 28)
-    if watchSound then imgui.PushStyleColor(ImGuiCol.Text, 0.85, 0.70, 0.32, 1)   -- gold = on
-    else imgui.PushStyleColor(ImGuiCol.Text, 0.45, 0.42, 0.50, 1) end             -- grey = off
-    imgui.Text(Icons.FA_VOLUME_UP)
-    imgui.PopStyleColor()
-    if imgui.IsItemClicked() then watchSound = not watchSound end
-    if imgui.IsItemHovered() then imgui.SetTooltip(watchSound and "Camp Watch sound: on" or "Camp Watch sound: off") end
     if watchOpen then
         imgui.BeginChild("##watchfeed", 0, 120, true)
         if #watchFeed == 0 then imgui.TextDisabled("  (quiet - nothing yet)") end
@@ -1179,10 +1228,83 @@ local function renderCampWatch()
     end
 end
 
+-- Timers tab: dense "who pops soon" board. One line per timed camp (name + countdown bar),
+-- sorted soonest-due via sortKey; not-yet-timed camps collapse to a single muted line. Glance-only.
+local function renderTimers()
+    local timed, notTimed = {}, 0
+    for _, e in ipairs(roster) do
+        if not e.hidden then
+            if e.isUp or e.killTime then timed[#timed + 1] = e
+            else notTimed = notTimed + 1 end
+        end
+    end
+    table.sort(timed, function(a, b)
+        local pa, ra = sortKey(a)
+        local pb, rb = sortKey(b)
+        if pa ~= pb then return pa < pb end
+        return ra < rb
+    end)
+
+    imgui.BeginChild("##timers", 0, 0, false)
+    if #timed == 0 then
+        imgui.TextDisabled("  No active timers - kill a camp mob to start its clock.")
+    end
+    for _, e in ipairs(timed) do
+        imgui.PushID("t_" .. e.name)
+        local label = #e.name > 16 and (e.name:sub(1, 16) .. "..") or e.name
+        if #e.locs > 1 then label = label .. string.format(" @x%d", #e.locs) end
+
+        if e.isUp then
+            imgui.TextColored(0.3, 1.0, 0.3, 1, label)
+            imgui.SameLine(172); imgui.TextColored(0.3, 1.0, 0.3, 1, "** UP **")
+        else
+            gold(label); imgui.SameLine(172)
+            local rs        = (respawnFor(e))
+            local elapsed   = os.time() - e.killTime
+            local remaining = rs - elapsed
+            if remaining > 0 then
+                local pct = remaining / rs
+                local r, g, b
+                if pct > 0.5 then r, g, b = 1.0, 0.3, 0.3
+                elseif pct > 0.2 then r, g, b = 1.0, 0.85, 0.2
+                else r, g, b = 0.3, 1.0, 0.3 end
+                local barH   = imgui.GetFrameHeight()
+                local barPos = imgui.GetCursorScreenPosVec()
+                local barW   = imgui.GetContentRegionAvailVec().x
+                imgui.PushStyleColor(ImGuiCol.PlotHistogram, r, g, b, 0.85)
+                imgui.ProgressBar(math.min(1.0, elapsed / rs), -1, barH, "")
+                imgui.PopStyleColor()
+                local txt = fmtClock(remaining)
+                local ts  = imgui.CalcTextSizeVec(txt)
+                local lx  = barPos.x + (barW - ts.x) * 0.5
+                local ly  = barPos.y + (barH - ts.y) * 0.5
+                local dl  = imgui.GetWindowDrawList()
+                dl:AddText(ImVec2(lx + 1, ly + 1), IM_COL32(0, 0, 0, 220), txt)
+                dl:AddText(ImVec2(lx, ly), IM_COL32(255, 255, 255, 255), txt)
+            elseif elapsed > rs * 3 then   -- window long blown - mute (matches Camps row)
+                imgui.TextDisabled(string.format("window long open (%s)", fmtElapsed(elapsed)))
+            else
+                local flash = (math.floor(mq.gettime() / 500) % 2 == 0)
+                local lbl   = string.format("** WINDOW OPEN **  (%s past)", fmtClock(-remaining))
+                if flash then imgui.TextColored(0.3, 1.0, 0.3, 1, lbl)
+                else imgui.TextColored(0.4, 0.4, 0.4, 0.5, lbl) end
+            end
+        end
+        imgui.PopID()
+    end
+    if notTimed > 0 then
+        imgui.Separator()
+        imgui.TextDisabled(string.format("  + %d not yet timed (no kill seen)", notTimed))
+    end
+    imgui.EndChild()
+end
+
 local function renderMain()
     local nc, nv = pushTheme()
-    imgui.SetNextWindowSize(360, 480, ImGuiCond.FirstUseEver)
-    local pOpen, shouldDraw = imgui.Begin("CroakWatch v" .. VERSION .. "##CroakWatch", true, ImGuiWindowFlags.NoScrollbar)
+    imgui.SetNextWindowSizeConstraints(520, 200, 520, 4000)   -- Unity-style locked width (520); height stays resizable (roster scrolls)
+    imgui.SetNextWindowSize(520, 560, ImGuiCond.FirstUseEver)
+    local pOpen, shouldDraw = imgui.Begin("CroakWatch v" .. VERSION .. "##CroakWatch", true,
+        bit32.bor(ImGuiWindowFlags.NoScrollbar, ImGuiWindowFlags.NoTitleBar))
     if not pOpen then
         running = false   -- X closes AND stops; use the mini-icon (_) to keep it running
         imgui.End(); imgui.PopStyleColor(nc); imgui.PopStyleVar(nv)
@@ -1199,11 +1321,14 @@ local function renderMain()
     imgui.SameLine(); imgui.TextDisabled("v" .. VERSION)
     imgui.SameLine(); if imgui.SmallButton(paused and "Resume" or "Pause") then paused = not paused end
     if paused then imgui.SameLine(); imgui.TextColored(0.95, 0.40, 0.40, 1, "[PAUSED]") end
-    -- minimize button right-aligned under the native X (can't inject into the title bar in this
-    -- ImGui binding, so this is the closest spot while keeping the styled button)
-    local minW = imgui.CalcTextSize("_") + imgui.GetStyle().FramePadding.x * 2   -- CalcTextSize returns x,y (numbers); first = width
-    imgui.SameLine(imgui.GetWindowWidth() - minW - imgui.GetStyle().FramePadding.x * 2)
-    if imgui.SmallButton("_") then minimized = true end
+    -- Custom window controls (no native title bar now): minimize + close, top-right. X stops the
+    -- script (as the native X did); _ drops to the mini-icon. NoTitleBar removes native dragging -
+    -- by default ImGui still lets you drag empty body space, so the header area should still move it.
+    local btnW = imgui.CalcTextSize("X") + imgui.GetStyle().FramePadding.x * 2   -- CalcTextSize returns x,y; first = width
+    imgui.SameLine(imgui.GetWindowWidth() - btnW * 2 - 14)
+    if imgui.SmallButton("_##min") then minimized = true end
+    imgui.SameLine()
+    if imgui.SmallButton("X##close") then running = false end
     imgui.TextDisabled(string.format("%s  -  %s", mq.TLO.Zone.Name() or "?", myServer ~= "" and myServer or "?"))
     zoneWatch = imgui.Checkbox("##zonewatch", zoneWatch)
     if imgui.IsItemHovered() then imgui.SetTooltip("Zone watch - alert when non-group players enter the zone") end
@@ -1213,69 +1338,132 @@ local function renderMain()
         if n == 0 then imgui.TextColored(0.42, 0.39, 0.50, 1, "zone clear")
         elseif n <= 4 then imgui.TextColored(0.91, 0.72, 0.31, 1, string.format("%d in zone", n))
         else imgui.TextColored(0.88, 0.35, 0.30, 1, string.format("%d in zone", n)) end
-        if imgui.IsItemHovered() and n > 0 then
+        if imgui.IsItemClicked() and n > 0 then imgui.OpenPopup("zonepcs") end
+        if imgui.IsItemHovered() and n > 0 then   -- quick-glance tooltip (capped so a huge zone stays small)
             imgui.BeginTooltip()
-            for _, p in ipairs(zonePcsList) do
+            for i, p in ipairs(zonePcsList) do
+                if i > 15 then imgui.TextDisabled(string.format("...and %d more - click to pin + scroll", n - 15)); break end
                 imgui.Text(string.format("%s [%d %s]  %s", p.name, p.level, p.class,
                     p.guild ~= "" and ("<" .. p.guild .. ">") or "no guild"))
             end
             imgui.EndTooltip()
+        end
+        if imgui.BeginPopup("zonepcs") then       -- pinned + scrollable (for crowded zones like PoK)
+            imgui.TextDisabled(string.format("Players in zone: %d (not your group)", #zonePcsList))
+            imgui.TextDisabled("Sort:"); imgui.SameLine()
+            if imgui.RadioButton("Name", zonePcsSort == "name") then zonePcsSort = "name" end
+            imgui.SameLine(); if imgui.RadioButton("Level", zonePcsSort == "level") then zonePcsSort = "level" end
+            imgui.Separator()
+            local sorted = {}
+            for _, p in ipairs(zonePcsList) do sorted[#sorted + 1] = p end
+            if zonePcsSort == "level" then
+                table.sort(sorted, function(a, b)
+                    if a.level ~= b.level then return a.level > b.level end   -- highest first
+                    return a.name:lower() < b.name:lower()
+                end)
+            else
+                table.sort(sorted, function(a, b) return a.name:lower() < b.name:lower() end)
+            end
+            imgui.BeginChild("##zpcs", 300, 300, false)
+            for _, p in ipairs(sorted) do
+                imgui.Text(string.format("%s [%d %s]  %s", p.name, p.level, p.class,
+                    p.guild ~= "" and ("<" .. p.guild .. ">") or "no guild"))
+            end
+            imgui.EndChild()
+            imgui.EndPopup()
         end
     else
         imgui.TextDisabled("zone watch off")
     end
     imgui.Separator()
 
-    imgui.TextDisabled("Show:"); imgui.SameLine()
-    if imgui.RadioButton("All", filterMode == 0) then filterMode = 0 end
-    imgui.SameLine(); if imgui.RadioButton("Up", filterMode == 1) then filterMode = 1 end
-    imgui.SameLine(); if imgui.RadioButton("Need", filterMode == 2) then filterMode = 2 end
-    imgui.SameLine(); showHidden = imgui.Checkbox("Hidden", showHidden)
-    imgui.SameLine(); soundOn    = imgui.Checkbox("Sound", soundOn)
-
-    renderLootWatch()
-    renderSoundTest()
-    renderQuickReplies()
-    imgui.Separator()
-
-    imgui.BeginChild("##list", 0, -(imgui.GetFrameHeightWithSpacing() * 2 + 14 + (watchOpen and 130 or 0)), true)
-    local vis = {}
-    for _, e in ipairs(roster) do
-        if showHidden or not e.hidden then
-            local show = true
-            if filterMode == 1 then show = e.isUp
-            elseif filterMode == 2 then show = not e.achDone end
-            if show then vis[#vis + 1] = e end
+    -- Tab area (everything between the header and the pinned Camp Watch footer). The footer is drawn
+    -- after this child so it stays at the bottom regardless of which tab is active.
+    local footerH = imgui.GetFrameHeightWithSpacing() + 18 + (watchOpen and 132 or 0)
+    imgui.BeginChild("##tabarea", 0, -footerH, false)
+    if imgui.BeginTabBar("##cwtabs") then
+        if imgui.BeginTabItem((Icons.FA_PAW or "") .. "  Camps") then
+            imgui.TextDisabled("Show:"); imgui.SameLine()
+            if imgui.RadioButton("All", filterMode == 0) then filterMode = 0 end
+            imgui.SameLine(); if imgui.RadioButton("Up", filterMode == 1) then filterMode = 1 end
+            imgui.SameLine(); if imgui.RadioButton("Need", filterMode == 2) then filterMode = 2 end
+            imgui.SameLine(); showHidden = imgui.Checkbox("Hidden", showHidden)
+            imgui.BeginChild("##list", 0, -imgui.GetFrameHeightWithSpacing(), true)
+            local vis = {}
+            for _, e in ipairs(roster) do
+                if showHidden or not e.hidden then
+                    local show = true
+                    if filterMode == 1 then show = e.isUp
+                    elseif filterMode == 2 then show = not e.achDone end
+                    if show then vis[#vis + 1] = e end
+                end
+            end
+            table.sort(vis, function(a, b)
+                local pa, ra = sortKey(a)
+                local pb, rb = sortKey(b)
+                if pa ~= pb then return pa < pb end
+                return ra < rb
+            end)
+            if #vis == 0 then
+                if not curAchID and #roster == 0 then
+                    imgui.TextColored(0.90, 0.80, 0.40, 1, "  This zone has no Hunter achievement.")
+                    imgui.TextDisabled("  That's why the list is empty - CroakWatch is working fine.")
+                    imgui.TextDisabled("  Use '+ Add Named' to track a mob here, or go to a Hunter zone.")
+                else
+                    imgui.TextDisabled("  No named to show.")
+                    imgui.TextDisabled("  Use 'Load from Achievement' or '+ Add Named'.")
+                end
+            end
+            for _, e in ipairs(vis) do renderRow(e) end
+            imgui.EndChild()
+            if imgui.Button("+ Add Named") then
+                addName, addPH, addOverride = "", "", 0
+                imgui.OpenPopup("addnamed")
+            end
+            if curAchID then
+                imgui.SameLine()
+                if imgui.Button("Load from Achievement") then loadFromAchievement() end
+            end
+            renderAddPopup()
+            imgui.EndTabItem()
         end
-    end
-    table.sort(vis, function(a, b)
-        local pa, ra = sortKey(a)
-        local pb, rb = sortKey(b)
-        if pa ~= pb then return pa < pb end
-        return ra < rb
-    end)
-    if #vis == 0 then
-        if not curAchID and #roster == 0 then
-            imgui.TextColored(0.90, 0.80, 0.40, 1, "  This zone has no Hunter achievement.")
-            imgui.TextDisabled("  That's why the list is empty - CroakWatch is working fine.")
-            imgui.TextDisabled("  Use '+ Add Named' to track a mob here, or go to a Hunter zone.")
-        else
-            imgui.TextDisabled("  No named to show.")
-            imgui.TextDisabled("  Use 'Load from Achievement' or '+ Add Named'.")
+        if imgui.BeginTabItem((Icons.FA_HOURGLASS or "") .. "  Timers") then
+            renderTimers()
+            imgui.EndTabItem()
         end
+        if imgui.BeginTabItem((Icons.FA_DIAMOND or "") .. "  Loot") then
+            renderLootWatch()
+            imgui.EndTabItem()
+        end
+        if imgui.BeginTabItem((Icons.FA_BAR_CHART or "") .. "  Stats") then
+            local nk, pk = 0, 0
+            for _, e in ipairs(roster) do nk = nk + (e.namedKills or 0); pk = pk + (e.phKills or 0) end
+            imgui.Text(string.format("Tracked this zone: %d", #roster))
+            imgui.Text(string.format("Named kills: %d", nk))
+            imgui.Text(string.format("PH kills: %d", pk))
+            imgui.TextDisabled("  (full all-time + per-camp breakdown is the real Stats tab - coming)")
+            imgui.EndTabItem()
+        end
+        if imgui.BeginTabItem((Icons.FA_BOOK or "") .. "  Notes") then
+            imgui.TextDisabled("  Coming: freeform notes you can jot per zone / camp.")
+            imgui.EndTabItem()
+        end
+        if imgui.BeginTabItem((Icons.FA_COG or "") .. "  Options") then
+            gold("Sounds")
+            soundOn = imgui.Checkbox("Sound (master - all CroakWatch sounds)", soundOn)
+            -- Camp Watch box shows unchecked (and ignores clicks) while master is off, so master-off
+            -- reads as "both off". The watchSound preference is kept + restored when master returns.
+            local newWatch = imgui.Checkbox("Camp Watch sound (tell / OOC chime)", soundOn and watchSound)
+            if soundOn then watchSound = newWatch end
+            renderSoundTest()
+            imgui.Separator()
+            gold("Quick Replies")
+            renderQuickReplies()
+            imgui.EndTabItem()
+        end
+        imgui.EndTabBar()
     end
-    for _, e in ipairs(vis) do renderRow(e) end
     imgui.EndChild()
-
-    if imgui.Button("+ Add Named") then
-        addName, addPH, addOverride = "", "", 0
-        imgui.OpenPopup("addnamed")
-    end
-    if curAchID then
-        imgui.SameLine()
-        if imgui.Button("Load from Achievement") then loadFromAchievement() end
-    end
-    renderAddPopup()
 
     renderCampWatch()
 

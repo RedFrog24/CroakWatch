@@ -240,12 +240,54 @@
 --        Correct call: (label, text, -1, 56). Verified vs macroquest/mq-definitions imgui.lua.
 -- v0.86: Loot Watch tidy - inv/bank counts in a fixed column (line up at x330) + tooltip noting the
 --        counts cover inventory + bank bags only (no Trade Depot / Dragon's Hoard; group = planned).
+-- v0.87: GROUP COUNTS via DanNet (the "end the camp early" feature). Each watched item shows
+--        "grp N/M" (green when everyone has it, amber otherwise) with a per-member tooltip.
+--        Observers (/dobserve FindItemCount[item]) registered once per (peer, item); values are read
+--        async from a cache refreshed on the MAIN loop every ~10s (never blocks render). Mercs are
+--        skipped via GroupMember.Mercenary (works out-of-zone); peers with no DanNet show "no data".
+--        Observers are dropped when an item is removed from the watch list.
+-- v0.88: fix stuck "no DanNet / no data" group counts. v0.87 marked an observer registered the moment
+--        /dobserve was SENT and never retried - a peer not yet visible to DanNet at that instant
+--        no-opped silently and stayed dark forever. Now ObserveSet (the plugin's own truth) gates the
+--        read, and registration is re-issued every refresh until the observer actually sticks.
+-- v0.89: Loot Watch matching is now CASE-INSENSITIVE substring ("glowing seb" matches "Glowing
+--        Sebilite..." drops) - manual lowercase/partial entries never matched before.
+-- v0.90: notes-save guard - a text change is accepted only while the field is FOCUSED (real
+--        keystroke), so a spurious widget return can't mark dirty and overwrite the saved note.
+-- v0.91: group counts include BANK (iTrack parity) - a second observer (FindItemBankCount) per
+--        member; "have" = inv+bank > 0; tooltip shows "name: inv N / bank N" per member.
+-- v0.92: Loot Watch input - hover it with an item on your cursor to auto-fill the name (+ the item
+--        returns to your bags), iTrack-style; empty-hover tooltip explains partial/case-free matching.
+-- v0.93: ITEM TOOLTIPS - hover any item name (Loot Watch, Recent Drops, Top Drops, the sidebar's
+--        per-named Loot) for its icon + stats (AC/HP/Mana, Dmg/Dly, LORE / NO TRADE). Icon via the
+--        A_DragItem texture sheet (cell = Item.Icon() - 500, the iTrack pattern). Data comes from
+--        FindItem/FindItemBank, so items you don't possess show a "no item data" line instead.
+-- v0.94: fuller item card (all members verified vs MQ docs datatype-item): type/weight/req/rec,
+--        AC/HP/Mana/Atk/Haste/regens, the seven stats (signed), heroics, all six resists, and
+--        Clicky (with charges) / Proc / Worn / Focus effect lines. Lines only show when non-empty.
+-- v0.95: EQ-style card ordering (flags under the name, heroics INLINE with stats "STR +25 (+5h)",
+--        rec/req last) + Ctrl+Right-Click a hovered item name opens the REAL EQ item display window
+--        via ItemLink('CLICKABLE') + /executelink (BigBag pattern) - the truly-full sheet, game-drawn.
+-- v0.96: identity block on the item card (BigBag parity, members verified in Grimmier's
+--        inventory_data.lua): ID / type / Size (0-4 -> Tiny..Giant), Classes (16 = All, else
+--        ShortNames), Races (16 = All), Wt, Qty owned/stack (stackables), Value in p/g/s/c, Tribute.
+-- v0.97: card prominence reorder + CONTAINERS: bags lead with "Container: N slots, holds <size>"
+--        (Container/SizeCapacity, verified in Grimmier's lib); practical line (Wt/Qty/Value/Tribute)
+--        next, Classes/Races after, and Type/Size/ID demoted to the bottom with Rec/Req.
+-- v0.98: COIN TRACKING - corpse loot + group splits ("You receive ... from the corpse / as your
+--        split", deliberately NOT merchant sales or trades) parsed per denomination and tallied:
+--        session + all-time (persisted per server). Shown atop the Loot tab and in Stats > All-Time.
+-- v0.99: Loot tab shows SESSION coin only (all-time lives in Stats, per AL).
+-- v1.00: LOOT WORTH TRACKING (odometer milestone). Items YOU loot are looked up in your bags on the
+--        loot event and their vendor Value + Tribute are tallied: session (Loot tab line: coin /
+--        items / tribute) + all-time (Stats > All-Time: item value looted, tribute looted), both
+--        persisted per server.
 
 local mq    = require('mq')
 local imgui = require('ImGui')
 local Icons = require('mq.Icons')
 
-local VERSION  = '0.86'
+local VERSION  = '1.00'
 local myServer = mq.TLO.EverQuest.Server() or ""
 
 local function serverSlug()
@@ -300,6 +342,10 @@ local zoneMap = {
 -- State (per-server, lives in the save file)
 
 local db           = {}    -- keyed by "zoneShort|inGameName"
+local coinTotal    = 0     -- all-time coin looted (in copper), persisted per server
+local coinSession  = 0     -- this session's coin looted (copper)
+local lootValTotal, lootValSession = 0, 0   -- vendor value of items YOU looted (copper; total persisted)
+local tribTotal, tribSession = 0, 0         -- tribute value of items YOU looted (total persisted)
 local roster       = {}    -- array of db entries for the current zone (rebuilt on zone change)
 local lootWatch    = {}    -- global per-server list of { item, count }
 local quickReplies = {}    -- per-server preset reply strings (Camp Watch quick-reply)
@@ -364,6 +410,20 @@ local function fmtElapsed(secs)
     return string.format("%dh %dm ago", math.floor(secs / 3600), math.floor((secs % 3600) / 60))
 end
 
+local function coinStr(copper)
+    if copper <= 0 then return "0c" end
+    local parts = {}
+    local pp = math.floor(copper / 1000)
+    if pp > 0 then parts[#parts + 1] = pp .. "p" end
+    local gg = math.floor(copper / 100) % 10
+    if gg > 0 then parts[#parts + 1] = gg .. "g" end
+    local ss = math.floor(copper / 10) % 10
+    if ss > 0 then parts[#parts + 1] = ss .. "s" end
+    local cc = copper % 10
+    if cc > 0 then parts[#parts + 1] = cc .. "c" end
+    return table.concat(parts, " ")
+end
+
 local function observedAvg(intervals)
     if #intervals < 3 then return nil end
     local sum = 0
@@ -404,7 +464,8 @@ local function saveAll()
             loot = e.loot,
         }
     end
-    mq.pickle(SAVE_FILE, { named = out, loot = lootWatch, replies = quickReplies, schema = 61 })
+    mq.pickle(SAVE_FILE, { named = out, loot = lootWatch, replies = quickReplies, coin = coinTotal,
+        itemval = lootValTotal, tribute = tribTotal, schema = 61 })
 end
 
 local function loadAll()
@@ -444,6 +505,9 @@ local function loadAll()
         end
     end
     lootWatch = saved.loot or {}
+    coinTotal = saved.coin or 0
+    lootValTotal = saved.itemval or 0
+    tribTotal    = saved.tribute or 0
     quickReplies = saved.replies or {
         "Camp's taken, sorry", "Yes camping here - welcome to join",
         "Open after my drop", "AFK, back shortly", "Live and camping here",
@@ -650,9 +714,20 @@ local function onLoot(item, looter, corpse)
     if paused then return end
     dropLog[#dropLog + 1] = { t = os.date("%H:%M"), item = item, who = looter or "?" }
     if #dropLog > 30 then table.remove(dropLog, 1) end
-    -- Global Loot Watch: targeted radar for items anywhere, anyone (item-name substring match).
+    -- Cash + tribute worth of items YOU loot: the item just landed in your bags, so look it up now.
+    if looter == "You" then
+        local li = mq.TLO.FindItem("=" .. item)
+        if li() ~= nil then
+            local v, t = li.Value() or 0, li.Tribute() or 0
+            if v > 0 then lootValSession = lootValSession + v; lootValTotal = lootValTotal + v end
+            if t > 0 then tribSession = tribSession + t; tribTotal = tribTotal + t end
+            if v > 0 or t > 0 then saveAll() end
+        end
+    end
+    -- Global Loot Watch: targeted radar for items anywhere, anyone. Case-insensitive substring so a
+    -- manual "glowing seb" matches "Glowing Sebilite Scale Boots" (was case-sensitive - never matched).
     for _, w in ipairs(lootWatch) do
-        if item:find(w.item, 1, true) then
+        if item:lower():find(w.item:lower(), 1, true) then
             w.count = w.count + 1
             info(string.format("\ag[DROP]\at %s (looted by %s, total %d)", w.item, looter or "?", w.count))
             if soundOn then mq.cmd('/popup ' .. w.item .. ' dropped') end
@@ -717,6 +792,24 @@ mq.event("cw_loot", "#*#looted a #*#", function(line)
     else item = line:match("looted a (.-)%.%-%-") or line:match("looted a (.+)%.") end
     if item then onLoot(item, looter, corpse) end
 end)
+-- Coin looted: corpse loot + group splits ONLY ("from the corpse" / "as your split" - deliberately
+-- does NOT match merchant sales or trades). Amounts parsed per denomination; commas stripped.
+local function onCoin(line)
+    if paused then return end
+    local copper = 0
+    local function grab(denom, mult)
+        local n = line:match("([%d,]+) " .. denom)
+        if n then copper = copper + (tonumber((n:gsub(",", ""))) or 0) * mult end
+    end
+    grab("platinum", 1000); grab("gold", 100); grab("silver", 10); grab("copper", 1)
+    if copper > 0 then
+        coinSession = coinSession + copper
+        coinTotal   = coinTotal + copper
+        saveAll()
+    end
+end
+mq.event("cw_coin_corpse", "You receive #*# from the corpse#*#", onCoin)
+mq.event("cw_coin_split",  "You receive #*# as your split#*#",   onCoin)
 -- Camp Watch capture (parse in Lua so multi-word names/messages survive). Loose patterns; the exact
 -- OOC/tell strings are verified in-game (the event simply won't fire if a server's format differs).
 mq.event("cw_ooc", "#*# says out of character, #*#", function(line)
@@ -961,6 +1054,8 @@ local editFor = nil                  -- which named the sidebar's inline edit bu
 local notesBuf, notesDirty = "", false
 local lootSort = "added"             -- Loot Watch sort: "added" | "name" | "count"
 local lootCountCache, lootCountAt = {}, 0   -- inv/bank counts per watched item, refreshed every 5s
+local grpObs = {}                    -- registered DanNet observers, keyed "peer|item"
+local grpCountCache = {}             -- per watched item: { have, total, who } - refreshed from the MAIN loop
 
 -- Purple/gold theme (Unity palette). Pushed before Begin so it skins the chrome.
 local function pushTheme()
@@ -1023,6 +1118,131 @@ local function trustBadge(e)
     elseif src == "observed" then suffix = string.format("(observed x%d)", #e.intervals)
     else suffix = "(" .. src .. ")" end
     imgui.TextDisabled(suffix)
+end
+
+-- Item hover-tooltip: icon + stats for any item we can find in inventory or bank. Icon drawn from
+-- MQ's item sheet: A_DragItem texture animation, cell = Item.Icon() - 500 (the iTrack pattern).
+-- Items we don't possess get a "no data" line - MQ has no all-items database to ask.
+local animItems = mq.FindTextureAnimation("A_DragItem")
+local EQ_ICON_OFFSET = 500
+local ITEM_SIZES = { [0] = "Tiny", [1] = "Small", [2] = "Medium", [3] = "Large", [4] = "Giant" }
+
+local function itemTooltip(name)
+    if not imgui.IsItemHovered() then return end
+    local it = mq.TLO.FindItem(name)
+    if it() == nil then it = mq.TLO.FindItemBank(name) end
+    -- Ctrl+Right-Click the hovered name -> open the REAL EQ item display via the item link
+    -- (BigBag pattern: ItemLink('CLICKABLE') + /executelink). The full sheet, drawn by the game.
+    if it() ~= nil and imgui.IsKeyDown(ImGuiMod.Ctrl) and imgui.IsItemClicked(ImGuiMouseButton.Right) then
+        local link = it.ItemLink('CLICKABLE')()
+        if link then mq.cmdf('/executelink %s', link) end
+    end
+    imgui.BeginTooltip()
+    if it() ~= nil then
+        local icon = it.Icon() or 0
+        if icon > 0 then
+            animItems:SetTextureCell(icon - EQ_ICON_OFFSET)
+            imgui.DrawTextureAnimation(animItems, 34, 34)
+            imgui.SameLine()
+        end
+        imgui.TextColored(0.90, 0.76, 0.36, 1, it.Name() or name)
+        -- EQ item-window ordering: flags under the name, type/weight, weapon line, AC/HP/Mana,
+        -- stats with heroics inline (STR +25 (+5h)), atk/regen, resists, effects, rec/req last.
+        local function line(parts) if #parts > 0 then imgui.TextDisabled(table.concat(parts, "  ")) end end
+        local p = {}
+        local function add(label, v)
+            v = v or 0
+            if v ~= 0 then p[#p + 1] = string.format("%s %d", label, v) end
+        end
+        local flags = {}
+        if it.Lore() then flags[#flags + 1] = "LORE ITEM" end
+        if it.NoDrop() then flags[#flags + 1] = "NO TRADE" end
+        if #flags > 0 then imgui.TextColored(0.90, 0.55, 0.45, 1, table.concat(flags, "   ")) end
+        -- identity block, prominence-ordered: what it IS (container/weapon traits) -> the practical
+        -- (wt/qty/value) -> who can use it -> type/size/ID demoted to the bottom line.
+        local slots = it.Container() or 0
+        if slots > 0 then   -- containers lead with their defining trait
+            local cap = ITEM_SIZES[it.SizeCapacity() or -1]
+            imgui.TextColored(0.45, 0.85, 0.85, 1, string.format("Container: %d slots%s", slots, cap and ("  holds " .. cap) or ""))
+        end
+        if (it.Damage() or 0) > 0 then imgui.TextDisabled(string.format("Dmg %d / Dly %d", it.Damage(), it.ItemDelay() or 0)) end
+        local wt = it.Weight() or 0
+        if wt > 0 then p[#p + 1] = string.format("Wt %.1f", wt / 10) end
+        local maxStack = it.StackSize() or 0
+        if maxStack > 1 then
+            local owned = (mq.TLO.FindItemCount(it.Name())() or 0) + (mq.TLO.FindItemBankCount(it.Name())() or 0)
+            p[#p + 1] = string.format("Qty %d / %d", owned, maxStack)
+        end
+        local val = it.Value() or 0
+        if val > 0 then
+            local coins = {}
+            local pp, gg, ss, cc = math.floor(val / 1000), math.floor(val / 100) % 10, math.floor(val / 10) % 10, val % 10
+            if pp > 0 then coins[#coins + 1] = pp .. "p" end
+            if gg > 0 then coins[#coins + 1] = gg .. "g" end
+            if ss > 0 then coins[#coins + 1] = ss .. "s" end
+            if cc > 0 then coins[#coins + 1] = cc .. "c" end
+            p[#p + 1] = "Value " .. table.concat(coins, " ")
+        end
+        add("Tribute", it.Tribute())
+        line(p); p = {}
+        local nc = it.Classes() or 0
+        if nc == 16 then p[#p + 1] = "Classes: All"
+        elseif nc > 0 then
+            local t = {}
+            for i = 1, nc do t[#t + 1] = it.Class(i).ShortName() or "?" end
+            p[#p + 1] = "Classes: " .. table.concat(t, " ")
+        end
+        local nr = it.Races() or 0
+        if nr == 16 then p[#p + 1] = "Races: All"
+        elseif nr > 0 then
+            local t = {}
+            for i = 1, nr do t[#t + 1] = (it.Race(i).Name() or "?"):sub(1, 3):upper() end
+            p[#p + 1] = "Races: " .. table.concat(t, " ")
+        end
+        line(p); p = {}
+        add("AC", it.AC()); add("HP", it.HP()); add("Mana", it.Mana())
+        line(p); p = {}
+        local stats = {
+            { "STR", it.STR(), it.HeroicSTR() }, { "STA", it.STA(), it.HeroicSTA() },
+            { "AGI", it.AGI(), it.HeroicAGI() }, { "DEX", it.DEX(), it.HeroicDEX() },
+            { "WIS", it.WIS(), it.HeroicWIS() }, { "INT", it.INT(), it.HeroicINT() },
+            { "CHA", it.CHA(), it.HeroicCHA() },
+        }
+        for _, s in ipairs(stats) do
+            local v, h = s[2] or 0, s[3] or 0
+            if v ~= 0 or h ~= 0 then
+                p[#p + 1] = string.format("%s %+d%s", s[1], v, h > 0 and string.format(" (+%dh)", h) or "")
+            end
+        end
+        line(p); p = {}
+        add("Atk", it.Attack()); add("Haste", it.Haste())
+        add("HP Regen", it.HPRegen()); add("Mana Regen", it.ManaRegen())
+        line(p); p = {}
+        add("SV Magic", it.svMagic()); add("Fire", it.svFire()); add("Cold", it.svCold())
+        add("Disease", it.svDisease()); add("Poison", it.svPoison()); add("Corrupt", it.svCorruption())
+        line(p); p = {}
+        local clicky, proc, worn, focus = it.Clicky(), it.Proc(), it.Worn(), it.Focus()
+        if clicky and clicky ~= "" then
+            local ch = it.Charges() or 0
+            imgui.TextColored(0.55, 0.85, 1.0, 1, "Clicky: " .. clicky .. (ch > 0 and string.format(" (%d charges)", ch) or ""))
+        end
+        if proc  and proc  ~= "" then imgui.TextColored(0.55, 0.85, 1.0, 1, "Proc: "  .. proc)  end
+        if worn  and worn  ~= "" then imgui.TextColored(0.55, 0.85, 1.0, 1, "Worn: "  .. worn)  end
+        if focus and focus ~= "" then imgui.TextColored(0.55, 0.85, 1.0, 1, "Focus: " .. focus) end
+        add("Rec", it.RecommendedLevel()); add("Req", it.RequiredLevel())
+        local typ = it.Type() or ""
+        if typ ~= "" then p[#p + 1] = typ end
+        local sz = ITEM_SIZES[it.Size() or -1]
+        if sz then p[#p + 1] = sz end
+        add("ID", it.ID())   -- demoted: least useful in-game, still there for lookups
+        line(p)
+        imgui.Separator()
+        imgui.TextDisabled("Ctrl+Right-Click: open the real item window")
+    else
+        imgui.Text(name)
+        imgui.TextDisabled("not in your inventory or bank - no item data to show")
+    end
+    imgui.EndTooltip()
 end
 
 -- Master list: one lean clickable line per named (status square + gold name + bar + time).
@@ -1189,7 +1409,9 @@ local function renderDetail(e)
     -- MQ's binding is (label, text, sizeX, sizeY, flags) - v0.77 accidentally passed 56 as FLAGS,
     -- which in ImGui 1.92's renumbered enum = CharsUppercase|CharsNoBlank -> forced ALL CAPS notes.
     local txt = imgui.InputTextMultiline("##notes", notesBuf, -1, 56)
-    if txt ~= notesBuf then notesBuf = txt; notesDirty = true end
+    -- Accept a change ONLY while the field is focused (a real keystroke). A spurious different
+    -- return while unfocused could otherwise mark dirty and overwrite the saved note.
+    if txt ~= notesBuf and imgui.IsItemActive() then notesBuf = txt; notesDirty = true end
     if notesDirty and not imgui.IsItemActive() then   -- save once when the field loses focus
         e.notes = notesBuf ~= "" and notesBuf or nil
         notesDirty = false
@@ -1262,6 +1484,7 @@ local function renderDetail(e)
         imgui.PushID(row.it)
         if imgui.SmallButton("X") then removeIt = row.it end
         imgui.SameLine(); imgui.TextDisabled(row.it)
+        itemTooltip(row.it)
         imgui.SameLine(); imgui.TextColored(0.3, 1.0, 0.3, 1, "x" .. row.cnt)
         imgui.PopID()
     end
@@ -1304,6 +1527,63 @@ local function renderAddPopup()
     end
 end
 
+-- Group counts for Loot Watch via DanNet observers. Register once per (peer, item); values arrive
+-- async and are READ from the cache - the refresh runs on the MAIN loop cadence, never in render.
+local function dropGroupObservers(item)
+    for key in pairs(grpObs) do
+        local peer, it = key:match("^(.-)|(.+)$")
+        if it == item then
+            mq.cmdf('/squelch /dobserve %s -q "FindItemCount[%s]" -drop', peer, item)
+            mq.cmdf('/squelch /dobserve %s -q "FindItemBankCount[%s]" -drop', peer, item)
+            grpObs[key] = nil
+        end
+    end
+end
+
+local function refreshGroupCounts()
+    grpCountCache = {}
+    if not mq.TLO.Plugin('MQ2DanNet').IsLoaded() then return end
+    local nMembers = mq.TLO.Group.Members() or 0
+    if nMembers == 0 or #lootWatch == 0 then return end
+    for _, w in ipairs(lootWatch) do
+        local qi = string.format("FindItemCount[%s]", w.item)
+        local qb = string.format("FindItemBankCount[%s]", w.item)   -- bank too (iTrack parity)
+        local selfInv  = mq.TLO.FindItemCount(w.item)() or 0
+        local selfBank = mq.TLO.FindItemBankCount(w.item)() or 0
+        local have, total = (selfInv + selfBank) > 0 and 1 or 0, 1
+        local who = { { name = mq.TLO.Me.CleanName() or "me", inv = selfInv, bank = selfBank } }
+        for i = 1, nMembers do
+            local m  = mq.TLO.Group.Member(i)
+            local nm = m.Name()
+            if nm and not m.Mercenary() then   -- GroupMember data works out-of-zone too (spawn TLOs don't)
+                local peer = nm:lower()
+                -- Trust ObserveSet, not our own bookkeeping: a /dobserve sent before the peer was
+                -- visible to DanNet silently no-ops. Re-issue every refresh until the observer sticks.
+                if mq.TLO.DanNet(peer).ObserveSet(qi)() then
+                    grpObs[peer .. "|" .. w.item] = true   -- confirmed active (item removal drops it)
+                    local rec = tonumber(mq.TLO.DanNet(peer).OReceived(qi)() or 0) or 0
+                    if rec > 0 then
+                        local inv  = tonumber(mq.TLO.DanNet(peer).O(qi)()) or 0
+                        local bank = mq.TLO.DanNet(peer).ObserveSet(qb)() and (tonumber(mq.TLO.DanNet(peer).O(qb)()) or 0) or 0
+                        total = total + 1
+                        if inv + bank > 0 then have = have + 1 end
+                        who[#who + 1] = { name = nm, inv = inv, bank = bank }
+                    else
+                        who[#who + 1] = { name = nm, inv = -1 }   -- observer set, first value still in flight
+                    end
+                else
+                    mq.cmdf('/squelch /dobserve %s -q "%s"', peer, qi)   -- (re)register - idempotent, retries every ~10s
+                    who[#who + 1] = { name = nm, inv = -1 }
+                end
+                if not mq.TLO.DanNet(peer).ObserveSet(qb)() then
+                    mq.cmdf('/squelch /dobserve %s -q "%s"', peer, qb)
+                end
+            end
+        end
+        grpCountCache[w.item] = { have = have, total = total, who = who }
+    end
+end
+
 local function renderLootWatch()
     -- inv/bank counts per watched item (cached - TLO scans are too heavy to run every frame)
     if mq.gettime() - lootCountAt > 5000 then
@@ -1332,6 +1612,7 @@ local function renderLootWatch()
         imgui.PushID(v.idx)
         if imgui.SmallButton("X") then rmIdx = v.idx end
         imgui.SameLine(); imgui.TextColored(0.79, 0.63, 0.91, 1, w.item)
+        itemTooltip(w.item)
         imgui.SameLine(); imgui.TextColored(0.3, 1.0, 0.3, 1, "x" .. w.count)
         local c = lootCountCache[w.item]
         if c then
@@ -1339,14 +1620,41 @@ local function renderLootWatch()
             if c.inv + c.bank > 0 then imgui.TextColored(0.45, 0.85, 0.85, 1, string.format("inv %d   bank %d", c.inv, c.bank))
             else imgui.TextDisabled("inv 0   bank 0") end
             if imgui.IsItemHovered() then
-                imgui.SetTooltip("your inventory + bank bags only -\nTrade Depot / Dragon's Hoard are not counted.\nGroup member counts: planned (needs DanNet).")
+                imgui.SetTooltip("your inventory + bank bags only -\nTrade Depot / Dragon's Hoard are not counted.")
+            end
+        end
+        local g = grpCountCache[w.item]
+        if g and g.total > 1 then
+            imgui.SameLine(460)
+            if g.have >= g.total then imgui.TextColored(0.3, 1.0, 0.3, 1, string.format("grp %d/%d", g.have, g.total))
+            else imgui.TextColored(0.95, 0.85, 0.35, 1, string.format("grp %d/%d", g.have, g.total)) end
+            if imgui.IsItemHovered() then
+                imgui.BeginTooltip()
+                for _, p in ipairs(g.who) do
+                    if (p.inv or -1) < 0 then imgui.TextDisabled(p.name .. ": no DanNet / no data yet")
+                    elseif p.inv + (p.bank or 0) > 0 then imgui.TextColored(0.3, 1.0, 0.3, 1, string.format("%s: inv %d / bank %d", p.name, p.inv, p.bank or 0))
+                    else imgui.Text(string.format("%s: inv 0 / bank 0", p.name)) end
+                end
+                imgui.TextDisabled("Trade Depot / Dragon's Hoard not counted")
+                imgui.EndTooltip()
             end
         end
         imgui.PopID()
     end
-    if rmIdx then table.remove(lootWatch, rmIdx); saveAll() end
+    if rmIdx then
+        dropGroupObservers(lootWatch[rmIdx].item)   -- clean up this item's DanNet observers
+        table.remove(lootWatch, rmIdx); saveAll()
+    end
     imgui.SetNextItemWidth(150)
     lootInput = imgui.InputText("##lootin", lootInput, 128)
+    if imgui.IsItemHovered() then
+        if mq.TLO.Cursor() ~= nil then   -- hover with an item on your cursor -> grab its name (iTrack-style)
+            lootInput = mq.TLO.Cursor.Name() or lootInput
+            mq.cmd("/autoinventory")
+        else
+            imgui.SetTooltip("type a partial name (case doesn't matter),\nor hover here with an item on your cursor")
+        end
+    end
     imgui.SameLine()
     if imgui.SmallButton("Add##lw") and lootInput ~= "" then
         lootWatch[#lootWatch + 1] = { item = lootInput, count = 0 }; lootInput = ""; saveAll()
@@ -1649,6 +1957,12 @@ local function renderMain()
         local lootOpen = imgui.BeginTabItem((Icons.FA_DIAMOND or "") .. "  Loot")
         imgui.PopStyleColor()
         if lootOpen then
+            imgui.TextDisabled("This session:  coin"); imgui.SameLine()
+            imgui.TextColored(0.90, 0.76, 0.36, 1, coinStr(coinSession)); imgui.SameLine()
+            imgui.TextDisabled("  items"); imgui.SameLine()
+            imgui.TextColored(0.79, 0.63, 0.91, 1, coinStr(lootValSession)); imgui.SameLine()
+            imgui.TextDisabled("  tribute"); imgui.SameLine()
+            imgui.TextColored(0.45, 0.85, 0.85, 1, tostring(tribSession))
             imgui.SeparatorText("Loot Watch")
             renderLootWatch()
 
@@ -1657,6 +1971,7 @@ local function renderMain()
             for i = #dropLog, math.max(1, #dropLog - 7), -1 do
                 imgui.TextDisabled(dropLog[i].t); imgui.SameLine()
                 imgui.TextColored(0.79, 0.63, 0.91, 1, dropLog[i].item)
+                itemTooltip(dropLog[i].item)
                 imgui.SameLine(); imgui.TextColored(0.45, 0.80, 0.80, 1, "- " .. dropLog[i].who)
             end
 
@@ -1677,7 +1992,9 @@ local function renderMain()
             if #tops == 0 then imgui.TextDisabled("no per-named drops recorded yet") end
             for i = 1, math.min(#tops, 8) do
                 imgui.TextColored(0.3, 1.0, 0.3, 1, "x" .. tops[i].cnt); imgui.SameLine()
-                imgui.TextColored(0.79, 0.63, 0.91, 1, tops[i].it); imgui.SameLine()
+                imgui.TextColored(0.79, 0.63, 0.91, 1, tops[i].it)
+                itemTooltip(tops[i].it)
+                imgui.SameLine()
                 imgui.TextColored(0.90, 0.76, 0.36, 1, "(" .. tops[i].src .. ")")
             end
             imgui.EndTabItem()
@@ -1719,6 +2036,12 @@ local function renderMain()
             for _ in pairs(zones) do zc = zc + 1 end
             imgui.Text(string.format("Croaks: %d   (named %d / PH %d)", tn + tp, tn, tp))
             imgui.Text(string.format("Zones tracked: %d", zc))
+            imgui.Text("Coin looted: "); imgui.SameLine(0, 0)
+            imgui.TextColored(0.90, 0.76, 0.36, 1, coinStr(coinTotal))
+            imgui.Text("Item value looted: "); imgui.SameLine(0, 0)
+            imgui.TextColored(0.79, 0.63, 0.91, 1, coinStr(lootValTotal))
+            imgui.Text("Tribute looted: "); imgui.SameLine(0, 0)
+            imgui.TextColored(0.45, 0.85, 0.85, 1, tostring(tribTotal))
             if bestIt then
                 imgui.Text("Top drop: "); imgui.SameLine(0, 0)
                 imgui.TextColored(0.79, 0.63, 0.91, 1, string.format("%s x%d", bestIt, bestItN))
@@ -1829,6 +2152,7 @@ info(string.format("v%s loaded for \ag%s\at. Tracking \ag%d\at named in this zon
 
 local lastZone = mq.TLO.Zone.ID()
 local tick = 0
+refreshGroupCounts()   -- register DanNet observers for watched items right away (values arrive async)
 
 while running do
     local z = mq.TLO.Zone.ID()
@@ -1850,6 +2174,7 @@ while running do
         pollZonePcs()
         tick = tick + 1
         if tick % 6 == 0 then refreshAchDone() end
+        if tick % 20 == 0 then refreshGroupCounts() end   -- DanNet group counts, every ~10s
     end
     mq.delay(500)
 end

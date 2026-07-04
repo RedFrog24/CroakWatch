@@ -171,12 +171,81 @@
 --        order is now override > named kill->kill (>=3) > zone default > fallback. Spot-cycle is
 --        still measured but is a placeholder stat, not the named's timer. One-time migration
 --        (schema 61): clears old intervals/spotIntervals (they were PH-polluted) to relearn clean.
+-- v0.62: GUI master-detail (slice 1). Camps is now a LEAN clickable list (status square + gold name
+--        + countdown bar + time); click a named -> a detail panel opens at the bottom with the full
+--        analytics + Reset/Clear/Edit/Hide/Loot. A Sort toggle (Due soonest / Name) folds the old
+--        Timers tab in - Timers tab removed. Flat theme for now; mockup-4 polish + class icons next.
+-- v0.63: detail panel actions. Click the named's name -> /target it (when up). New Nav button ->
+--        /nav loc to the NEAREST banked spot (a fixed camp loc, NOT /nav target which chases the live
+--        spawn). Verified: /loc is Y X Z but /nav loc wants X Y Z; our locs store .x/.y/.z so no reorder.
+-- v0.64: fix name-click targeting the corpse (a corpse shares the name) - now targets the live npc by
+--        id (npc filter skips corpses).
+-- v0.65: tabs get a little color - each tab label tinted a distinct hue (Camps gold, Loot blue, Stats
+--        green, Notes lavender, Options gray) via ImGuiCol.Text (stable across the 1.92 tab-enum rename).
+-- v0.66: ROAMER FIX. Bank a loc ONLY on the down->up transition (a fresh spawn), not every frame while
+--        up - so a roamer records just its spawn point, not its whole patrol (was @x6 in Blightfire);
+--        true multi-spawn still accumulates its real fixed points. Clear now also wipes e.locs so the
+--        polluted spot data can be reset and relearned clean.
+-- v0.67: Nav fix. `/nav loc x y z` failed "not on navmesh" because our stored Z floats off the mesh
+--        (that's why /nav target worked - it uses FloorHeight). Now: UP -> `/nav id` to the live mob
+--        (FloorHeight, mesh-safe); DOWN -> `/nav locxy` (2D, finds the floor itself) to nearest spot.
+-- v0.68: Nav now echoes which mode it used ("live mob (nav id)" vs "banked spot (nav locxy)") so it's
+--        clear which path fired.
+-- v0.69: "Roams" flag (Edit popup checkbox). Open-world roamers wander out of the client's spawn range,
+--        which reads as false respawns and banks junk spots (Blightfire @x6). Flagged mobs skip loc
+--        banking and use name-poll only (no spot tracking). Pair with Clear to wipe existing junk spots.
+-- v0.70: master-detail rebuild, STEP 1 of 4 - window locked to 650 (was 520) and the Camps list rows
+--        tightened: the countdown bar is now a short fixed-width chip, left-packed (the big "pretty"
+--        bar will live in the coming persistent sidebar). Sidebar/croaks-row/Camp-Watch reseat next.
+-- v0.71: STEP 2 - persistent detail SIDEBAR. Camps is now list-left + sidebar-right (was list-top /
+--        detail-bottom). The list is a resizable child (ChildFlags.ResizeX - drag its right edge to
+--        size the split, MageGear pattern); the sidebar shows the selected mob's detail, or a "select
+--        a camp" empty state. Detail button row wraps to 2 rows to fit the narrow sidebar.
+-- v0.72: split is now FIXED (dropped ResizeX per AL) - list 380, sidebar fills the rest.
+-- v0.73: STEP 3 - bottom row: RECENT CROAKS (session feed of named kills, newest first) + CROAK STATS
+--        (all-time for this server: total/named/PH croaks, most-killed named, avg learned respawn).
+-- v0.74: sidebar gets the "pretty" bar back - the big full-width countdown bar with the shadowed
+--        "Xm until window" label (was plain text since the v0.62 refactor). List keeps its small chips.
+-- v0.75: Reset button tooltip ("mark killed NOW - restarts the countdown, keeps learned data") so
+--        Reset vs Clear is self-explanatory.
+-- v0.76: STEP 4 - Camp Watch reseated: footer padding slimmed so it hugs the true bottom, and the
+--        croaks/stats row grew to 100px showing 3 recent croaks without crowding.
+-- v0.77: STEP 5 - sidebar SECTIONS; the Edit + Loot popups are RETIRED. The sidebar now shows, always
+--        visible under the timer/buttons: NOTES (new per-named freeform text, persisted, saves when
+--        the field loses focus), LOCATION (every banked spot listed in /loc Y,X order, each with its
+--        own Go button - per-spot nav), SPAWN SETTINGS (override/PH+Target/radius/Hidden/Roams inline,
+--        Save + red Remove), and LOOT (the per-named drop tallies with X-remove). Buttons row is now
+--        just Reset / Clear / Nav. Edit buffers load per selection (editFor) and reset on zone change.
+-- v0.78: Hide restored as an INSTANT button (Reset / Clear / Hide / Nav) - it's a quick toggle, not a
+--        setting; removed the Hidden checkbox from Spawn Settings (Save no longer touches hidden).
+-- v0.79: LOOT HUB - the Loot tab is now item-axis central: Loot Watch (unchanged) + RECENT DROPS
+--        (new session dropLog fed from onLoot: time, item, looter) + TOP DROPS (per-named tallies
+--        aggregated across the server db, each item showing its best source mob).
+-- v0.80: STATS DASHBOARD - the Stats tab stub replaced: CAMP OVERVIEW (this zone: up / window open /
+--        due <1h / later / no clock), ALL-TIME (croaks named/PH, zones tracked, top-drop trophy
+--        line), and a LEADERBOARD (top 5 most-croaked named with named-%). Mob axis; items live in Loot.
+-- v0.81: KILL-CREDIT DISTANCE GATE (leaderboard showed a mob AL never killed). Presence loss only
+--        counts as a kill if the mob was last seen within KILL_RANGE (200) - from farther away it's a
+--        despawn / someone else's kill / out-of-client-range, which was corrupting kills AND timers.
+--        Also: an EMPTY spot read from beyond SPOT_TRUST_RANGE (600) is ignored entirely (mob may just
+--        be out of spawn range), and spot-clear PH credit is KILL_RANGE-gated too. Values are starting
+--        points to tune in field. Old polluted counts: use Clear on the affected named.
+-- v0.82: Loot Watch sort (Added / Name / Count radios).
+-- v0.83: Loot Watch shows (inv N / bank N) per watched item - FindItemCount/FindItemBankCount,
+--        cached every 5s; teal when you hold any. Group counts need DanNet - future.
+-- v0.84: Loot tab colors - watch items purple; Recent Drops looter teal; Top Drops source mob gold.
+-- v0.85: FIX all-caps Notes. MQ's InputTextMultiline is (label, text, sizeX, sizeY, flags) - the
+--        sandbox def I coded against had a maxLen param MQ doesn't, so 56 landed in FLAGS, which in
+--        ImGui 1.92's renumbered enum = CharsUppercase|CharsNoBlank (forced CAPS + ate spaces).
+--        Correct call: (label, text, -1, 56). Verified vs macroquest/mq-definitions imgui.lua.
+-- v0.86: Loot Watch tidy - inv/bank counts in a fixed column (line up at x330) + tooltip noting the
+--        counts cover inventory + bank bags only (no Trade Depot / Dragon's Hoard; group = planned).
 
 local mq    = require('mq')
 local imgui = require('ImGui')
 local Icons = require('mq.Icons')
 
-local VERSION  = '0.61'
+local VERSION  = '0.86'
 local myServer = mq.TLO.EverQuest.Server() or ""
 
 local function serverSlug()
@@ -200,6 +269,8 @@ local ZONE_RESPAWN = {
 local GLOBAL_RESPAWN = 20 * 60   -- neutral fallback when zone unknown; observation/override refine it
 
 local SPOT_RADIUS_DEFAULT = 30   -- units around a named's captured loc counted as "the spot"
+local KILL_RANGE       = 200     -- credit a kill only if the mob was last seen within this range (starting value - tune in field)
+local SPOT_TRUST_RANGE = 600     -- beyond this an EMPTY spot read means nothing (mob may just be out of client spawn range)
 local PH_THRESHOLD        = 2    -- distinct spawns on the spot before a mob is learned as a PH
 
 -- Achievement objective name -> in-game spawn name corrections
@@ -324,7 +395,8 @@ local function saveAll()
     for key, e in pairs(db) do
         out[key] = {
             name = e.name, achName = e.achName, zone = e.zone, manual = e.manual,
-            ph = e.ph, override = e.override, hidden = e.hidden, locs = e.locs,
+            ph = e.ph, override = e.override, hidden = e.hidden, locs = e.locs, roams = e.roams,
+            notes = e.notes,
             killTime = e.killTime, whoKilled = e.whoKilled,
             phKills = e.phKills, namedKills = e.namedKills, intervals = e.intervals,
             spotRadius = e.spotRadius, spotIntervals = e.spotIntervals,
@@ -523,6 +595,14 @@ local soundFiles = listSounds()
 
 -- Kill + loot detection
 
+local croakLog = {}   -- session-only rolling feed of recent named kills (the Recent Croaks panel)
+local function logCroak(name)
+    croakLog[#croakLog + 1] = { t = os.date("%H:%M"), name = name }
+    if #croakLog > 30 then table.remove(croakLog, 1) end
+end
+
+local dropLog = {}    -- session-only rolling feed of loot-line drops (the Loot tab's Recent Drops)
+
 local function recordKill(e, isNamed)
     if not isNamed then
         -- v0.61: a placeholder kill feeds the COUNT only. It must not touch killTime or intervals -
@@ -542,6 +622,7 @@ local function recordKill(e, isNamed)
     e.whoKilled  = "named"
     e.alerted    = false
     e.namedKills = e.namedKills + 1
+    logCroak(e.name)   -- feed the Recent Croaks panel (named kills only for now)
     if not e.hidden then
         info(string.format("%s \ag[NAMED]\at down - respawn ~%s", e.name, fmtDur((respawnFor(e)))))
     end
@@ -567,6 +648,8 @@ end
 
 local function onLoot(item, looter, corpse)
     if paused then return end
+    dropLog[#dropLog + 1] = { t = os.date("%H:%M"), item = item, who = looter or "?" }
+    if #dropLog > 30 then table.remove(dropLog, 1) end
     -- Global Loot Watch: targeted radar for items anywhere, anyone (item-name substring match).
     for _, w in ipairs(lootWatch) do
         if item:find(w.item, 1, true) then
@@ -649,9 +732,11 @@ end)
 
 -- Name-poll: for a named we have NOT located yet. Polls by unique name only to detect it
 -- the first time and capture its loc; once loc exists, pollSpot takes over for that named.
--- Bank the named's current spot into e.locs if it's a NEW one (multi-loc: a named with a cluster of
--- spawn points). Guard against a junk read (a just-spawned mob can report 0,0,0 for a frame).
+-- Bank a named's SPAWN spot into e.locs (multi-loc: a named with a cluster of fixed spawn points).
+-- Called ONLY on a down->up transition (v0.66) - banking every frame while up logged a ROAMER's whole
+-- patrol as fake "spots" (Blightfire @x6). Dedups within spotRadius, caps at 6. Guards a junk 0,0,0 read.
 local function bankLoc(e, sp)
+    if e.roams then return end   -- roamers wander out of client spawn range -> false respawns bank junk spots; don't
     local y, x, z = sp.Y(), sp.X(), sp.Z()
     if not y or not x or (y == 0 and x == 0 and (z or 0) == 0) then return end
     local r = e.spotRadius or SPOT_RADIUS_DEFAULT
@@ -667,14 +752,14 @@ end
 local function pollByName(e)
     local sp    = mq.TLO.Spawn(string.format('npc "%s"', e.name))
     local nowUp = sp() ~= nil and (sp.CleanName() or "") == e.name
-
-    if nowUp then bankLoc(e, sp) end
+    if nowUp then e.upDist = sp.Distance() or 999 end   -- runtime-only: how close were we last time it was up
 
     if not e.seen then
         e.isUp = nowUp
         e.seen = true
     else
         if not e.isUp and nowUp then
+            bankLoc(e, sp)   -- capture the SPAWN spot on the down->up transition (not patrol points)
             if not e.hidden then
                 local where = string.format("(%dm %s)", math.floor(sp.Distance() or 0), sp.HeadingTo.ShortName() or "?")
                 info(string.format("\ag** %s IS UP **\at  %s", e.name, where))
@@ -682,8 +767,12 @@ local function pollByName(e)
             end
             e.alerted = true
         elseif e.isUp and not nowUp then
-            if not e.killTime or os.time() - e.killTime > 30 then
-                recordKill(e, true)
+            -- Presence loss is only a KILL if we were close enough to have done it. From across the
+            -- zone it's a despawn, someone else's kill, or the mob leaving client spawn range.
+            if (e.upDist or 999) <= KILL_RANGE then
+                if not e.killTime or os.time() - e.killTime > 30 then
+                    recordKill(e, true)
+                end
             end
         end
         e.isUp = nowUp
@@ -701,14 +790,15 @@ local function pollSpot(e)
     -- Reliable signal: is THIS named (unique name) present anywhere in zone?
     local sp = mq.TLO.Spawn(string.format('npc "%s"', e.name))
     local namedUp = sp() ~= nil
-    if namedUp then bankLoc(e, sp) end
+    if namedUp then e.upDist = sp.Distance() or 999 end   -- runtime-only: how close were we last time it was up
 
     if not e.spotSeen then   -- first pass: adopt current state silently (no load-time alert)
         e.spotSeen, e.isUp, e.spotOccupant = true, namedUp, nil
         return
     end
 
-    if namedUp and not e.isUp then            -- named just came UP
+    if namedUp and not e.isUp then            -- named just came UP = a fresh spawn
+        bankLoc(e, sp)                        -- capture the SPAWN spot here, not while it roams
         if not e.hidden then
             local where = string.format("(%dm %s)", math.floor(sp.Distance() or 0), sp.HeadingTo.ShortName() or "?")
             info(string.format("\ag** %s IS UP **\at  %s", e.name, where))
@@ -716,10 +806,14 @@ local function pollSpot(e)
         end
         e.isUp, e.alerted = true, true
         e.spotOccupant, e.spotEmptyTime = nil, nil
-    elseif not namedUp and e.isUp then        -- named just went DOWN = killed (active camp)
+    elseif not namedUp and e.isUp then        -- named just went DOWN
         e.isUp = false
-        if not e.killTime or os.time() - e.killTime > 30 then
-            recordKill(e, true)               -- credit + start clock, regardless of what's on the spot
+        -- Only a KILL if we were close enough to have done it (see pollByName) - else it's a
+        -- despawn / someone else / out-of-range, and crediting it corrupts kills + the timer.
+        if (e.upDist or 999) <= KILL_RANGE then
+            if not e.killTime or os.time() - e.killTime > 30 then
+                recordKill(e, true)           -- credit + start clock, regardless of what's on the spot
+            end
         end
     end
 
@@ -739,6 +833,16 @@ local function pollSpot(e)
 
     local prev = e.spotOccupant
     if occ == prev then return end            -- no transition: do nothing, DON'T save (kills the churn)
+
+    -- How close are we to the nearest banked spot? An EMPTY read from far away means nothing -
+    -- the mob may simply be outside the client's spawn range, not dead.
+    local meX, meY = mq.TLO.Me.X() or 0, mq.TLO.Me.Y() or 0
+    local nearD2 = math.huge
+    for _, L in ipairs(e.locs) do
+        local d2 = (L.x - meX) ^ 2 + (L.y - meY) ^ 2
+        if d2 < nearD2 then nearD2 = d2 end
+    end
+    if occ == nil and nearD2 > SPOT_TRUST_RANGE * SPOT_TRUST_RANGE then return end   -- unreliable read: no transition
 
     local changed = false
     if occ ~= nil then
@@ -764,10 +868,12 @@ local function pollSpot(e)
                 end
             end
         end
-    else                                      -- occ == nil: spot cleared = a placeholder was killed
+    else                                      -- occ == nil: spot cleared (trusted read - we're within range)
         e.spotEmptyTime = os.time()
-        e.phKills = e.phKills + 1             -- count only; a PH kill must NOT touch the named's clock (v0.61)
-        changed = true
+        if nearD2 <= KILL_RANGE * KILL_RANGE then   -- only OUR camp's clears count as PH kills
+            e.phKills = e.phKills + 1         -- count only; a PH kill must NOT touch the named's clock (v0.61)
+            changed = true
+        end
     end
 
     e.spotOccupant = occ
@@ -776,7 +882,7 @@ end
 
 local function pollSpawns()
     for _, e in ipairs(roster) do
-        if #e.locs > 0 then pollSpot(e) else pollByName(e) end
+        if #e.locs > 0 and not e.roams then pollSpot(e) else pollByName(e) end   -- roamers use name-poll, no spot tracking
     end
 end
 
@@ -846,9 +952,15 @@ local lootInput  = ""
 local voiceInput = ""
 local replyInput = ""
 local zonePcsSort = "name"   -- pinned zone-players list sort: "name" (alpha) or "level"
+local selectedName = nil     -- Camps master-detail: which named's detail panel is open (nil = none)
+local sortMode = "due"       -- Camps list sort: "due" (soonest first, folds in Timers) or "name" (alpha)
 
 local addName, addPH, addOverride = "", "", 0
-local editOverride, editPH, editHidden, editSpotRadius = 0, "", false, 0
+local editOverride, editPH, editSpotRadius, editRoams = 0, "", 0, false
+local editFor = nil                  -- which named the sidebar's inline edit buffers are loaded for
+local notesBuf, notesDirty = "", false
+local lootSort = "added"             -- Loot Watch sort: "added" | "name" | "count"
+local lootCountCache, lootCountAt = {}, 0   -- inv/bank counts per watched item, refreshed every 5s
 
 -- Purple/gold theme (Unity palette). Pushed before Begin so it skins the chrome.
 local function pushTheme()
@@ -913,26 +1025,67 @@ local function trustBadge(e)
     imgui.TextDisabled(suffix)
 end
 
-local function renderRow(e)
+-- Master list: one lean clickable line per named (status square + gold name + bar + time).
+-- Click selects it -> renderDetail shows the full analytics below. Drawn on a Selectable via the
+-- window draw list so the whole row is one click target.
+local function renderLeanRow(e)
+    local sel   = (selectedName == e.name)
+    local p     = imgui.GetCursorScreenPosVec()
+    if imgui.Selectable("##row" .. e.name, sel) then
+        selectedName = sel and nil or e.name
+    end
+    local _, h = imgui.CalcTextSize("A")
+    local dl   = imgui.GetWindowDrawList()
+    local cy   = p.y + h * 0.5
+
+    local dcol = IM_COL32(120, 108, 140, 255)                 -- no clock yet
+    if e.isUp then dcol = IM_COL32(77, 217, 115, 255)         -- up = green
+    elseif e.killTime then
+        local rem = (respawnFor(e)) - (os.time() - e.killTime)
+        dcol = rem <= 0 and IM_COL32(216, 90, 77, 255) or IM_COL32(230, 165, 46, 255)   -- open red / counting amber
+    end
+    dl:AddRectFilled(ImVec2(p.x + 4, cy - 4), ImVec2(p.x + 11, cy + 4), dcol, 2)
+
+    local nm = #e.name > 18 and (e.name:sub(1, 18) .. "..") or e.name
+    if #e.locs > 1 then nm = nm .. string.format(" @x%d", #e.locs) end
+    dl:AddText(ImVec2(p.x + 18, p.y), IM_COL32(230, 194, 90, 255), nm)   -- gold name
+
+    -- short fixed-width bar, left-packed (list stays tight; the big "pretty" bar lives in the sidebar)
+    local barX, barW = p.x + 172, 64
+    if e.isUp then
+        dl:AddText(ImVec2(barX, p.y), IM_COL32(77, 217, 115, 255), "** UP **")
+    elseif e.killTime then
+        local rs, el = (respawnFor(e)), os.time() - e.killTime
+        local rem = rs - el
+        local timeStr, pct, fr, fg, fb
+        if rem > 0 then timeStr, pct, fr, fg, fb = fmtClock(rem), math.min(1.0, el / rs), 122, 82, 200
+        elseif el > rs * 3 then timeStr, pct, fr, fg, fb = "long", 1.0, 90, 78, 120
+        else timeStr, pct, fr, fg, fb = "OPEN", 1.0, 208, 74, 60 end
+        dl:AddRectFilled(ImVec2(barX, cy - 5), ImVec2(barX + barW, cy + 5), IM_COL32(255, 255, 255, 28), 3)
+        dl:AddRectFilled(ImVec2(barX, cy - 5), ImVec2(barX + barW * pct, cy + 5), IM_COL32(fr, fg, fb, 220), 3)
+        dl:AddText(ImVec2(barX + barW + 8, p.y), IM_COL32(180, 165, 210, 255), timeStr)
+    else
+        dl:AddText(ImVec2(barX, p.y), IM_COL32(120, 110, 140, 255), "waiting")
+    end
+end
+
+-- Detail panel: the full analytics + actions for the selected named (moved off the lean row).
+local function renderDetail(e)
     imgui.PushID(e.name)
 
     gold(e.name)
+    if imgui.IsItemClicked() then   -- target the LIVE npc by id (npc filter skips corpses, which share the name)
+        local sp = mq.TLO.Spawn(string.format('npc "%s"', e.name))
+        if (sp.ID() or 0) > 0 then mq.cmdf('/target id %d', sp.ID()) end
+    end
+    if imgui.IsItemHovered() then imgui.SetTooltip("click to target " .. e.name .. " (when up)") end
     if e.isUp then imgui.SameLine(); imgui.TextColored(0.3, 1.0, 0.3, 1, " [UP]") end
     if e.achDone == true then imgui.SameLine(); imgui.TextColored(0.45, 0.85, 0.45, 1, " done")
     elseif e.achDone == false then imgui.SameLine(); imgui.TextDisabled(" need") end
-    if #e.locs > 0 then
-        imgui.SameLine()
-        local phConfirmed = #e.ph > 0
-        local badge = #e.locs > 1 and string.format(" @x%d", #e.locs) or " @"
-        if phConfirmed then imgui.TextColored(0.40, 0.90, 0.50, 1, badge)   -- loc + PH confirmed
-        else imgui.TextColored(0.55, 0.45, 0.75, 1, badge) end              -- loc only
-        if imgui.IsItemHovered() then
-            local spots = string.format("%d spot%s banked", #e.locs, #e.locs > 1 and "s" or "")
-            if phConfirmed then imgui.SetTooltip(spots .. " - PH confirmed: " .. joinCSV(e.ph))
-            else imgui.SetTooltip(spots .. " (no PH confirmed yet)") end
-        end
-    end
     if e.hidden then imgui.SameLine(); imgui.TextDisabled(" (hidden)") end
+    if e.roams then imgui.SameLine(); imgui.TextColored(0.55, 0.75, 0.95, 1, " (roams)") end
+    imgui.SameLine(imgui.GetWindowWidth() - 32)
+    if imgui.SmallButton("x##closedetail") then selectedName = nil end
 
     trustBadge(e)
 
@@ -942,23 +1095,23 @@ local function renderRow(e)
             local rs        = (respawnFor(e))
             local remaining = rs - elapsed
             if remaining > 0 then
+                -- the "pretty" bar: full sidebar width, taller than the list chips, shadowed label
                 local pct = remaining / rs
                 local r, g, b
                 if pct > 0.5 then r, g, b = 1.0, 0.3, 0.3
                 elseif pct > 0.2 then r, g, b = 1.0, 0.85, 0.2
                 else r, g, b = 0.3, 1.0, 0.3 end
-                local barH   = imgui.GetFrameHeight()                   -- font + padding: fits text (was 14, clipped)
-                local barPos = imgui.GetCursorScreenPosVec()            -- top-left before drawing (Vec = ImVec2)
-                local barW   = imgui.GetContentRegionAvailVec().x       -- ProgressBar(-1) fills this width
+                local barH   = imgui.GetFrameHeight() + 6
+                local barPos = imgui.GetCursorScreenPosVec()
+                local barW   = imgui.GetContentRegionAvailVec().x
                 imgui.PushStyleColor(ImGuiCol.PlotHistogram, r, g, b, 0.85)
-                imgui.ProgressBar(math.min(1.0, elapsed / rs), -1, barH, "")   -- no built-in overlay
+                imgui.ProgressBar(math.min(1.0, elapsed / rs), -1, barH, "")
                 imgui.PopStyleColor()
-                -- draw the label ourselves with a shadow so white stays readable over the bright fill
                 local label = fmtClock(remaining) .. " until window"
                 local ts = imgui.CalcTextSizeVec(label)
+                local dl = imgui.GetWindowDrawList()
                 local lx = barPos.x + (barW - ts.x) * 0.5
                 local ly = barPos.y + (barH - ts.y) * 0.5
-                local dl = imgui.GetWindowDrawList()
                 dl:AddText(ImVec2(lx + 1, ly + 1), IM_COL32(0, 0, 0, 220), label)
                 dl:AddText(ImVec2(lx, ly), IM_COL32(255, 255, 255, 255), label)
             elseif elapsed > rs * 3 then   -- window blown so long the number is meaningless - mute it
@@ -983,90 +1136,139 @@ local function renderRow(e)
         imgui.TextDisabled(string.format("    kills: PH %d / Named %d (%d%% named)", e.phKills, e.namedKills, math.floor(e.namedKills / total * 100)))
     end
 
+    -- Load the inline Spawn Settings buffers when the selection changes
+    if editFor ~= e.name then
+        editFor        = e.name
+        editOverride   = e.override and math.floor(e.override / 60) or 0
+        editPH         = joinCSV(e.ph)
+        editSpotRadius = e.spotRadius or SPOT_RADIUS_DEFAULT
+        editRoams      = e.roams or false
+        notesBuf, notesDirty = e.notes or "", false
+    end
+
     if imgui.SmallButton("Reset") then
         e.killTime = os.time(); e.whoKilled = "manual"; e.alerted = false; saveAll()
     end
+    if imgui.IsItemHovered() then imgui.SetTooltip("mark killed NOW - restarts the countdown (keeps all learned data)") end
     imgui.SameLine()
     if imgui.SmallButton("Clear") then
         e.killTime, e.whoKilled, e.alerted = nil, nil, false
         e.phKills, e.namedKills, e.intervals = 0, 0, {}
         e.spotIntervals, e.phCandidates, e.spotEmptyTime = {}, {}, nil
         e.spotOccupant, e.spotSeen = nil, nil
+        e.locs = {}   -- reset banked spots too (wipes roamer patrol-point pollution; relearns on next spawn)
+        saveAll()
+    end
+    if imgui.IsItemHovered() then imgui.SetTooltip("reset timers, kills, and banked spots for this named") end
+    imgui.SameLine()
+    if imgui.SmallButton(e.hidden and "Show" or "Hide") then e.hidden = not e.hidden; saveAll() end   -- instant, no Save needed
+    if e.isUp or #e.locs > 0 then
+        imgui.SameLine()
+        if imgui.SmallButton("Nav") then
+            local sp = mq.TLO.Spawn(string.format('npc "%s"', e.name))
+            if (sp.ID() or 0) > 0 then
+                mq.cmdf('/nav id %d', sp.ID())   -- up: nav to the LIVE mob (uses FloorHeight - mesh-safe, unlike a raw stored Z)
+                info(string.format("Nav to \ag%s\at - live mob (nav id)", e.name))
+            elseif #e.locs > 0 then
+                local meX, meY = mq.TLO.Me.X() or 0, mq.TLO.Me.Y() or 0
+                local best, bestD = nil, math.huge
+                for _, L in ipairs(e.locs) do
+                    local d = (L.x - meX) ^ 2 + (L.y - meY) ^ 2
+                    if d < bestD then bestD, best = d, L end
+                end
+                if best then
+                    mq.cmdf('/nav locxy %.2f %.2f', best.x, best.y)   -- down: 2D nav finds the floor itself (avoids off-mesh Z)
+                    info(string.format("Nav to \ag%s\at - banked spot (nav locxy)", e.name))
+                end
+            end
+        end
+        if imgui.IsItemHovered() then imgui.SetTooltip("nav to the mob if up, else its nearest banked spot") end
+    end
+
+    imgui.SeparatorText("Notes")
+    -- MQ's binding is (label, text, sizeX, sizeY, flags) - v0.77 accidentally passed 56 as FLAGS,
+    -- which in ImGui 1.92's renumbered enum = CharsUppercase|CharsNoBlank -> forced ALL CAPS notes.
+    local txt = imgui.InputTextMultiline("##notes", notesBuf, -1, 56)
+    if txt ~= notesBuf then notesBuf = txt; notesDirty = true end
+    if notesDirty and not imgui.IsItemActive() then   -- save once when the field loses focus
+        e.notes = notesBuf ~= "" and notesBuf or nil
+        notesDirty = false
+        saveAll()
+    end
+
+    imgui.SeparatorText("Location")
+    if #e.locs == 0 then
+        imgui.TextDisabled(e.roams and "roamer - no fixed spots" or "no spots banked yet")
+    else
+        for i, L in ipairs(e.locs) do
+            imgui.PushID("spot" .. i)
+            if imgui.SmallButton("Go") then
+                mq.cmdf('/nav locxy %.2f %.2f', L.x, L.y)
+                info(string.format("Nav to \ag%s\at spot %d (nav locxy)", e.name, i))
+            end
+            imgui.SameLine()
+            imgui.TextDisabled(string.format("%d)  %.0f, %.0f", i, L.y, L.x))   -- shown in EQ /loc order: Y, X
+            imgui.PopID()
+        end
+    end
+
+    imgui.SeparatorText("Spawn Settings")
+    imgui.SetNextItemWidth(100)
+    editOverride = imgui.InputInt("Override min", editOverride)
+    if editOverride < 0 then editOverride = 0 end
+    if imgui.IsItemHovered() then imgui.SetTooltip("manual respawn override in minutes (0 = learn automatically)") end
+    imgui.SetNextItemWidth(130)
+    editPH = imgui.InputText("PH", editPH, 256)
+    if imgui.IsItemHovered() then imgui.SetTooltip("placeholder names, comma separated") end
+    imgui.SameLine()
+    if imgui.SmallButton("Target##ep") then
+        local t = mq.TLO.Target.CleanName()
+        if t then editPH = editPH == "" and t or (editPH .. ", " .. t) end
+    end
+    imgui.SetNextItemWidth(100)
+    editSpotRadius = imgui.InputInt("Spot radius", editSpotRadius)
+    if editSpotRadius < 0 then editSpotRadius = 0 end
+    editRoams = imgui.Checkbox("Roams", editRoams)
+    if imgui.IsItemHovered() then imgui.SetTooltip("roamer: name-poll only, no spot tracking (clears banked spots)") end
+    if imgui.SmallButton("Save##edit") then
+        e.override   = editOverride > 0 and editOverride * 60 or nil
+        e.ph         = splitCSV(editPH)
+        e.spotRadius = (editSpotRadius > 0 and editSpotRadius ~= SPOT_RADIUS_DEFAULT) and editSpotRadius or nil
+        e.roams      = editRoams or nil
+        if e.roams then e.locs = {} end   -- a roamer's banked spots are junk - clear them when flagged
         saveAll()
     end
     imgui.SameLine()
-    if imgui.SmallButton("Edit") then
-        editOverride   = e.override and math.floor(e.override / 60) or 0
-        editPH         = joinCSV(e.ph)
-        editHidden     = e.hidden
-        editSpotRadius = e.spotRadius or SPOT_RADIUS_DEFAULT
-        imgui.OpenPopup("edit##" .. e.name)
+    imgui.PushStyleColor(ImGuiCol.Button,        0.45, 0.12, 0.12, 0.9)
+    imgui.PushStyleColor(ImGuiCol.ButtonHovered, 0.65, 0.18, 0.18, 1)
+    if imgui.SmallButton("Remove##edit") then
+        db[dbKey(e.zone, e.name)] = nil
+        selectedName, editFor = nil, nil
+        saveAll(); rosterRebuild()
     end
-    imgui.SameLine()
-    if imgui.SmallButton(e.hidden and "Show" or "Hide") then e.hidden = not e.hidden; saveAll() end
-    imgui.SameLine()
-    if imgui.SmallButton("Loot") then imgui.OpenPopup("loot##" .. e.name) end
-
-    if imgui.BeginPopup("loot##" .. e.name) then
-        gold(e.name .. " loot")
-        imgui.Separator()
-        local items = {}
-        for it, cnt in pairs(e.loot) do items[#items + 1] = { it = it, cnt = cnt } end
-        table.sort(items, function(a, b) return a.cnt > b.cnt end)
-        if #items == 0 then imgui.TextDisabled("no drops recorded yet") end
-        local removeIt = nil
-        for _, row in ipairs(items) do
-            imgui.PushID(row.it)
-            if imgui.SmallButton("X") then removeIt = row.it end
-            imgui.SameLine(); imgui.TextDisabled(row.it)
-            imgui.SameLine(); imgui.TextColored(0.3, 1.0, 0.3, 1, "x" .. row.cnt)
-            imgui.PopID()
-        end
-        if removeIt then e.loot[removeIt] = nil; saveAll() end
-        imgui.EndPopup()
+    imgui.PopStyleColor(2)
+    if imgui.IsItemHovered() then
+        if e.manual then imgui.SetTooltip("remove this named from the list")
+        else imgui.SetTooltip("achievement mob - returns on reload; use Hide to keep it off") end
     end
 
-    if imgui.BeginPopup("edit##" .. e.name) then
-        gold("Edit " .. e.name)
-        imgui.Separator()
-        editOverride = imgui.InputInt("Override min (0=auto)", editOverride)
-        if editOverride < 0 then editOverride = 0 end
-        editPH = imgui.InputText("PH (comma sep)", editPH, 256)
-        imgui.SameLine()
-        if imgui.SmallButton("Target##ep") then
-            local t = mq.TLO.Target.CleanName()
-            if t then editPH = editPH == "" and t or (editPH .. ", " .. t) end
-        end
-        editSpotRadius = imgui.InputInt("Spot radius", editSpotRadius)
-        if editSpotRadius < 0 then editSpotRadius = 0 end
-        editHidden = imgui.Checkbox("Hidden", editHidden)
-        if imgui.Button("Save##edit") then
-            e.override   = editOverride > 0 and editOverride * 60 or nil
-            e.ph         = splitCSV(editPH)
-            e.hidden     = editHidden
-            e.spotRadius = (editSpotRadius > 0 and editSpotRadius ~= SPOT_RADIUS_DEFAULT) and editSpotRadius or nil
-            saveAll()
-            imgui.CloseCurrentPopup()
-        end
-        imgui.SameLine()
-        if imgui.Button("Cancel##edit") then imgui.CloseCurrentPopup() end
-        imgui.Separator()
-        if not e.manual then
-            imgui.TextDisabled("achievement mob - returns on reload; use Hide to keep it off")
-        end
-        imgui.PushStyleColor(ImGuiCol.Button,        0.45, 0.12, 0.12, 0.9)
-        imgui.PushStyleColor(ImGuiCol.ButtonHovered, 0.65, 0.18, 0.18, 1)
-        if imgui.Button("Remove from list##edit") then
-            db[dbKey(e.zone, e.name)] = nil
-            saveAll(); rosterRebuild()
-            imgui.CloseCurrentPopup()
-        end
-        imgui.PopStyleColor(2)
-        imgui.EndPopup()
+    imgui.SeparatorText("Loot")
+    local items = {}
+    for it, cnt in pairs(e.loot) do items[#items + 1] = { it = it, cnt = cnt } end
+    table.sort(items, function(a, b) return a.cnt > b.cnt end)
+    if #items == 0 then imgui.TextDisabled("no drops recorded yet") end
+    local removeIt = nil
+    for _, row in ipairs(items) do
+        imgui.PushID(row.it)
+        if imgui.SmallButton("X") then removeIt = row.it end
+        imgui.SameLine(); imgui.TextDisabled(row.it)
+        imgui.SameLine(); imgui.TextColored(0.3, 1.0, 0.3, 1, "x" .. row.cnt)
+        imgui.PopID()
     end
+    if removeIt then e.loot[removeIt] = nil; saveAll() end
+
 
     imgui.PopID()
-    imgui.Separator()
 end
 
 local function renderAddPopup()
@@ -1103,15 +1305,46 @@ local function renderAddPopup()
 end
 
 local function renderLootWatch()
-    for i = #lootWatch, 1, -1 do
-        local w = lootWatch[i]
-        imgui.PushID(i)
-        local rm = imgui.SmallButton("X")
-        imgui.SameLine(); imgui.TextDisabled(w.item)
-        imgui.SameLine(); imgui.TextColored(0.3, 1.0, 0.3, 1, "x" .. w.count)
-        imgui.PopID()
-        if rm then table.remove(lootWatch, i); saveAll() end
+    -- inv/bank counts per watched item (cached - TLO scans are too heavy to run every frame)
+    if mq.gettime() - lootCountAt > 5000 then
+        lootCountAt, lootCountCache = mq.gettime(), {}
+        for _, w in ipairs(lootWatch) do
+            lootCountCache[w.item] = {
+                inv  = mq.TLO.FindItemCount(w.item)() or 0,
+                bank = mq.TLO.FindItemBankCount(w.item)() or 0,
+            }
+        end
     end
+    imgui.TextDisabled("Sort:"); imgui.SameLine()
+    if imgui.RadioButton("Added##ls", lootSort == "added") then lootSort = "added" end
+    imgui.SameLine(); if imgui.RadioButton("Name##ls", lootSort == "name") then lootSort = "name" end
+    imgui.SameLine(); if imgui.RadioButton("Count##ls", lootSort == "count") then lootSort = "count" end
+    local view = {}
+    for i, w in ipairs(lootWatch) do view[#view + 1] = { idx = i, w = w } end
+    if lootSort == "name" then
+        table.sort(view, function(a, b) return a.w.item:lower() < b.w.item:lower() end)
+    elseif lootSort == "count" then
+        table.sort(view, function(a, b) return a.w.count > b.w.count end)
+    end
+    local rmIdx = nil
+    for _, v in ipairs(view) do
+        local w = v.w
+        imgui.PushID(v.idx)
+        if imgui.SmallButton("X") then rmIdx = v.idx end
+        imgui.SameLine(); imgui.TextColored(0.79, 0.63, 0.91, 1, w.item)
+        imgui.SameLine(); imgui.TextColored(0.3, 1.0, 0.3, 1, "x" .. w.count)
+        local c = lootCountCache[w.item]
+        if c then
+            imgui.SameLine(330)   -- fixed column so the counts line up regardless of item-name length
+            if c.inv + c.bank > 0 then imgui.TextColored(0.45, 0.85, 0.85, 1, string.format("inv %d   bank %d", c.inv, c.bank))
+            else imgui.TextDisabled("inv 0   bank 0") end
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip("your inventory + bank bags only -\nTrade Depot / Dragon's Hoard are not counted.\nGroup member counts: planned (needs DanNet).")
+            end
+        end
+        imgui.PopID()
+    end
+    if rmIdx then table.remove(lootWatch, rmIdx); saveAll() end
     imgui.SetNextItemWidth(150)
     lootInput = imgui.InputText("##lootin", lootInput, 128)
     imgui.SameLine()
@@ -1228,81 +1461,10 @@ local function renderCampWatch()
     end
 end
 
--- Timers tab: dense "who pops soon" board. One line per timed camp (name + countdown bar),
--- sorted soonest-due via sortKey; not-yet-timed camps collapse to a single muted line. Glance-only.
-local function renderTimers()
-    local timed, notTimed = {}, 0
-    for _, e in ipairs(roster) do
-        if not e.hidden then
-            if e.isUp or e.killTime then timed[#timed + 1] = e
-            else notTimed = notTimed + 1 end
-        end
-    end
-    table.sort(timed, function(a, b)
-        local pa, ra = sortKey(a)
-        local pb, rb = sortKey(b)
-        if pa ~= pb then return pa < pb end
-        return ra < rb
-    end)
-
-    imgui.BeginChild("##timers", 0, 0, false)
-    if #timed == 0 then
-        imgui.TextDisabled("  No active timers - kill a camp mob to start its clock.")
-    end
-    for _, e in ipairs(timed) do
-        imgui.PushID("t_" .. e.name)
-        local label = #e.name > 16 and (e.name:sub(1, 16) .. "..") or e.name
-        if #e.locs > 1 then label = label .. string.format(" @x%d", #e.locs) end
-
-        if e.isUp then
-            imgui.TextColored(0.3, 1.0, 0.3, 1, label)
-            imgui.SameLine(172); imgui.TextColored(0.3, 1.0, 0.3, 1, "** UP **")
-        else
-            gold(label); imgui.SameLine(172)
-            local rs        = (respawnFor(e))
-            local elapsed   = os.time() - e.killTime
-            local remaining = rs - elapsed
-            if remaining > 0 then
-                local pct = remaining / rs
-                local r, g, b
-                if pct > 0.5 then r, g, b = 1.0, 0.3, 0.3
-                elseif pct > 0.2 then r, g, b = 1.0, 0.85, 0.2
-                else r, g, b = 0.3, 1.0, 0.3 end
-                local barH   = imgui.GetFrameHeight()
-                local barPos = imgui.GetCursorScreenPosVec()
-                local barW   = imgui.GetContentRegionAvailVec().x
-                imgui.PushStyleColor(ImGuiCol.PlotHistogram, r, g, b, 0.85)
-                imgui.ProgressBar(math.min(1.0, elapsed / rs), -1, barH, "")
-                imgui.PopStyleColor()
-                local txt = fmtClock(remaining)
-                local ts  = imgui.CalcTextSizeVec(txt)
-                local lx  = barPos.x + (barW - ts.x) * 0.5
-                local ly  = barPos.y + (barH - ts.y) * 0.5
-                local dl  = imgui.GetWindowDrawList()
-                dl:AddText(ImVec2(lx + 1, ly + 1), IM_COL32(0, 0, 0, 220), txt)
-                dl:AddText(ImVec2(lx, ly), IM_COL32(255, 255, 255, 255), txt)
-            elseif elapsed > rs * 3 then   -- window long blown - mute (matches Camps row)
-                imgui.TextDisabled(string.format("window long open (%s)", fmtElapsed(elapsed)))
-            else
-                local flash = (math.floor(mq.gettime() / 500) % 2 == 0)
-                local lbl   = string.format("** WINDOW OPEN **  (%s past)", fmtClock(-remaining))
-                if flash then imgui.TextColored(0.3, 1.0, 0.3, 1, lbl)
-                else imgui.TextColored(0.4, 0.4, 0.4, 0.5, lbl) end
-            end
-        end
-        imgui.PopID()
-    end
-    if notTimed > 0 then
-        imgui.Separator()
-        imgui.TextDisabled(string.format("  + %d not yet timed (no kill seen)", notTimed))
-    end
-    imgui.EndChild()
-end
-
 local function renderMain()
     local nc, nv = pushTheme()
-    imgui.SetNextWindowSizeConstraints(520, 200, 520, 4000)   -- Unity-style locked width (520); height stays resizable (roster scrolls)
-    imgui.SetNextWindowSize(520, 560, ImGuiCond.FirstUseEver)
+    imgui.SetNextWindowSizeConstraints(650, 200, 650, 4000)   -- locked 650 width (was 520) for the master-detail layout; height resizable
+    imgui.SetNextWindowSize(650, 600, ImGuiCond.FirstUseEver)
     local pOpen, shouldDraw = imgui.Begin("CroakWatch v" .. VERSION .. "##CroakWatch", true,
         bit32.bor(ImGuiWindowFlags.NoScrollbar, ImGuiWindowFlags.NoTitleBar))
     if not pOpen then
@@ -1379,16 +1541,31 @@ local function renderMain()
 
     -- Tab area (everything between the header and the pinned Camp Watch footer). The footer is drawn
     -- after this child so it stays at the bottom regardless of which tab is active.
-    local footerH = imgui.GetFrameHeightWithSpacing() + 18 + (watchOpen and 132 or 0)
+    local footerH = imgui.GetFrameHeightWithSpacing() + 6 + (watchOpen and 132 or 0)   -- slim padding: Camp Watch hugs the true bottom
     imgui.BeginChild("##tabarea", 0, -footerH, false)
     if imgui.BeginTabBar("##cwtabs") then
-        if imgui.BeginTabItem((Icons.FA_PAW or "") .. "  Camps") then
-            imgui.TextDisabled("Show:"); imgui.SameLine()
+        imgui.PushStyleColor(ImGuiCol.Text, 0.90, 0.76, 0.36, 1)   -- gold
+        local campsOpen = imgui.BeginTabItem((Icons.FA_PAW or "") .. "  Camps")
+        imgui.PopStyleColor()
+        if campsOpen then
+            imgui.TextDisabled("Sort:"); imgui.SameLine()
+            if imgui.RadioButton("Due", sortMode == "due") then sortMode = "due" end
+            imgui.SameLine(); if imgui.RadioButton("Name", sortMode == "name") then sortMode = "name" end
+            imgui.SameLine(); imgui.TextDisabled(" Show:"); imgui.SameLine()
             if imgui.RadioButton("All", filterMode == 0) then filterMode = 0 end
             imgui.SameLine(); if imgui.RadioButton("Up", filterMode == 1) then filterMode = 1 end
             imgui.SameLine(); if imgui.RadioButton("Need", filterMode == 2) then filterMode = 2 end
             imgui.SameLine(); showHidden = imgui.Checkbox("Hidden", showHidden)
-            imgui.BeginChild("##list", 0, -imgui.GetFrameHeightWithSpacing(), true)
+            if imgui.SmallButton("+ Add") then
+                addName, addPH, addOverride = "", "", 0
+                imgui.OpenPopup("addnamed")
+            end
+            if curAchID then
+                imgui.SameLine()
+                if imgui.SmallButton("Load from Ach") then loadFromAchievement() end
+            end
+            renderAddPopup()
+
             local vis = {}
             for _, e in ipairs(roster) do
                 if showHidden or not e.hidden then
@@ -1398,57 +1575,182 @@ local function renderMain()
                     if show then vis[#vis + 1] = e end
                 end
             end
-            table.sort(vis, function(a, b)
-                local pa, ra = sortKey(a)
-                local pb, rb = sortKey(b)
-                if pa ~= pb then return pa < pb end
-                return ra < rb
-            end)
+            if sortMode == "name" then
+                table.sort(vis, function(a, b) return a.name:lower() < b.name:lower() end)
+            else
+                table.sort(vis, function(a, b)
+                    local pa, ra = sortKey(a)
+                    local pb, rb = sortKey(b)
+                    if pa ~= pb then return pa < pb end
+                    return ra < rb
+                end)
+            end
+
+            local selEntry = nil
+            if selectedName then
+                for _, e in ipairs(vis) do if e.name == selectedName then selEntry = e break end end
+            end
+
+            -- List (left, fixed 380) + persistent detail sidebar (right, fills the rest). A bottom
+            -- row below both holds Recent Croaks + Croak Stats.
+            local bottomH = 100
+            imgui.BeginChild("##list", 380, -bottomH, true)
             if #vis == 0 then
                 if not curAchID and #roster == 0 then
                     imgui.TextColored(0.90, 0.80, 0.40, 1, "  This zone has no Hunter achievement.")
                     imgui.TextDisabled("  That's why the list is empty - CroakWatch is working fine.")
-                    imgui.TextDisabled("  Use '+ Add Named' to track a mob here, or go to a Hunter zone.")
+                    imgui.TextDisabled("  Use '+ Add' to track a mob here, or go to a Hunter zone.")
                 else
                     imgui.TextDisabled("  No named to show.")
-                    imgui.TextDisabled("  Use 'Load from Achievement' or '+ Add Named'.")
+                    imgui.TextDisabled("  Use 'Load from Ach' or '+ Add'.")
                 end
             end
-            for _, e in ipairs(vis) do renderRow(e) end
+            for _, e in ipairs(vis) do renderLeanRow(e) end
             imgui.EndChild()
-            if imgui.Button("+ Add Named") then
-                addName, addPH, addOverride = "", "", 0
-                imgui.OpenPopup("addnamed")
+            imgui.SameLine()
+            imgui.BeginChild("##sidebar", 0, -bottomH, true)
+            if selEntry then
+                renderDetail(selEntry)
+            else
+                imgui.Spacing()
+                imgui.TextDisabled("  Select a camp on the left")
+                imgui.TextDisabled("  to see its details.")
             end
-            if curAchID then
-                imgui.SameLine()
-                if imgui.Button("Load from Achievement") then loadFromAchievement() end
+            imgui.EndChild()
+
+            -- Bottom row: Recent Croaks (named-kill feed) + Croak Stats (all-time, this server)
+            local halfW = (imgui.GetContentRegionAvailVec().x - 6) * 0.5
+            imgui.BeginChild("##croaks", halfW, 0, true)
+            imgui.TextColored(0.56, 0.45, 0.84, 1, "RECENT CROAKS")
+            if #croakLog == 0 then imgui.TextDisabled("nothing yet this session") end
+            for i = #croakLog, math.max(1, #croakLog - 2), -1 do   -- 3 lines fit the 100px row without crowding
+                imgui.TextDisabled(croakLog[i].t); imgui.SameLine()
+                imgui.TextColored(0.90, 0.76, 0.36, 1, croakLog[i].name)
             end
-            renderAddPopup()
+            imgui.EndChild()
+            imgui.SameLine()
+            imgui.BeginChild("##croakstats", 0, 0, true)
+            imgui.TextColored(0.56, 0.45, 0.84, 1, "CROAK STATS")
+            local tn, tp, mostName, mostN, rsum, rcnt = 0, 0, nil, 0, 0, 0
+            for _, e in pairs(db) do
+                local nk, pk = e.namedKills or 0, e.phKills or 0
+                tn = tn + nk; tp = tp + pk
+                if nk + pk > mostN then mostN = nk + pk; mostName = e.name end
+                local a = observedAvg(e.intervals)
+                if a then rsum = rsum + a; rcnt = rcnt + 1 end
+            end
+            imgui.TextDisabled(string.format("croaks %d  -  named %d / PH %d", tn + tp, tn, tp))
+            if mostName then imgui.TextDisabled(string.format("most: %s (%d)", mostName, mostN)) end
+            if rcnt > 0 then imgui.TextDisabled("avg respawn " .. fmtDur(math.floor(rsum / rcnt))) end
+            imgui.EndChild()
             imgui.EndTabItem()
         end
-        if imgui.BeginTabItem((Icons.FA_HOURGLASS or "") .. "  Timers") then
-            renderTimers()
-            imgui.EndTabItem()
-        end
-        if imgui.BeginTabItem((Icons.FA_DIAMOND or "") .. "  Loot") then
+        imgui.PushStyleColor(ImGuiCol.Text, 0.55, 0.75, 1.0, 1)   -- blue
+        local lootOpen = imgui.BeginTabItem((Icons.FA_DIAMOND or "") .. "  Loot")
+        imgui.PopStyleColor()
+        if lootOpen then
+            imgui.SeparatorText("Loot Watch")
             renderLootWatch()
+
+            imgui.SeparatorText("Recent Drops")
+            if #dropLog == 0 then imgui.TextDisabled("no drops seen this session") end
+            for i = #dropLog, math.max(1, #dropLog - 7), -1 do
+                imgui.TextDisabled(dropLog[i].t); imgui.SameLine()
+                imgui.TextColored(0.79, 0.63, 0.91, 1, dropLog[i].item)
+                imgui.SameLine(); imgui.TextColored(0.45, 0.80, 0.80, 1, "- " .. dropLog[i].who)
+            end
+
+            imgui.SeparatorText("Top Drops")
+            -- item axis: aggregate every named's per-mob tallies across the server db
+            local agg = {}
+            for _, e in pairs(db) do
+                for it, cnt in pairs(e.loot) do
+                    local a = agg[it]
+                    if not a then a = { it = it, cnt = 0, src = "?", srcN = 0 }; agg[it] = a end
+                    a.cnt = a.cnt + cnt
+                    if cnt > a.srcN then a.srcN, a.src = cnt, e.name end   -- best source mob
+                end
+            end
+            local tops = {}
+            for _, a in pairs(agg) do tops[#tops + 1] = a end
+            table.sort(tops, function(x, y) return x.cnt > y.cnt end)
+            if #tops == 0 then imgui.TextDisabled("no per-named drops recorded yet") end
+            for i = 1, math.min(#tops, 8) do
+                imgui.TextColored(0.3, 1.0, 0.3, 1, "x" .. tops[i].cnt); imgui.SameLine()
+                imgui.TextColored(0.79, 0.63, 0.91, 1, tops[i].it); imgui.SameLine()
+                imgui.TextColored(0.90, 0.76, 0.36, 1, "(" .. tops[i].src .. ")")
+            end
             imgui.EndTabItem()
         end
-        if imgui.BeginTabItem((Icons.FA_BAR_CHART or "") .. "  Stats") then
-            local nk, pk = 0, 0
-            for _, e in ipairs(roster) do nk = nk + (e.namedKills or 0); pk = pk + (e.phKills or 0) end
-            imgui.Text(string.format("Tracked this zone: %d", #roster))
-            imgui.Text(string.format("Named kills: %d", nk))
-            imgui.Text(string.format("PH kills: %d", pk))
-            imgui.TextDisabled("  (full all-time + per-camp breakdown is the real Stats tab - coming)")
+        imgui.PushStyleColor(ImGuiCol.Text, 0.55, 0.88, 0.55, 1)   -- green
+        local statsOpen = imgui.BeginTabItem((Icons.FA_BAR_CHART or "") .. "  Stats")
+        imgui.PopStyleColor()
+        if statsOpen then
+            imgui.SeparatorText("Camp Overview - this zone")
+            local up, open, soon, later, untimed = 0, 0, 0, 0, 0
+            for _, e in ipairs(roster) do
+                if not e.hidden then
+                    if e.isUp then up = up + 1
+                    elseif e.killTime then
+                        local rem = (respawnFor(e)) - (os.time() - e.killTime)
+                        if rem <= 0 then open = open + 1
+                        elseif rem < 3600 then soon = soon + 1
+                        else later = later + 1 end
+                    else untimed = untimed + 1 end
+                end
+            end
+            imgui.TextColored(0.3, 1.0, 0.3, 1, string.format("Up now: %d", up))
+            imgui.SameLine(140); imgui.TextColored(0.90, 0.45, 0.40, 1, string.format("Window open: %d", open))
+            imgui.TextColored(0.95, 0.85, 0.35, 1, string.format("Due soon (<1h): %d", soon))
+            imgui.SameLine(140); imgui.TextDisabled(string.format("Later: %d", later))
+            imgui.TextDisabled(string.format("No clock yet: %d   (tracked: %d)", untimed, #roster))
+
+            imgui.SeparatorText("All-Time - this server")
+            local tn, tp, zones = 0, 0, {}
+            local bestIt, bestItN = nil, 0
+            for _, e in pairs(db) do
+                tn = tn + (e.namedKills or 0); tp = tp + (e.phKills or 0)
+                zones[e.zone] = true
+                for it, cnt in pairs(e.loot) do
+                    if cnt > bestItN then bestItN, bestIt = cnt, it end
+                end
+            end
+            local zc = 0
+            for _ in pairs(zones) do zc = zc + 1 end
+            imgui.Text(string.format("Croaks: %d   (named %d / PH %d)", tn + tp, tn, tp))
+            imgui.Text(string.format("Zones tracked: %d", zc))
+            if bestIt then
+                imgui.Text("Top drop: "); imgui.SameLine(0, 0)
+                imgui.TextColored(0.79, 0.63, 0.91, 1, string.format("%s x%d", bestIt, bestItN))
+            end
+
+            imgui.SeparatorText("Leaderboard - most croaked")
+            local board = {}
+            for _, e in pairs(db) do
+                local tot = (e.namedKills or 0) + (e.phKills or 0)
+                if tot > 0 then board[#board + 1] = { name = e.name, tot = tot, nk = e.namedKills or 0 } end
+            end
+            table.sort(board, function(a, b) return a.tot > b.tot end)
+            if #board == 0 then imgui.TextDisabled("no kills recorded yet") end
+            for i = 1, math.min(#board, 5) do
+                local b = board[i]
+                imgui.TextDisabled(string.format("%d.", i)); imgui.SameLine()
+                imgui.TextColored(0.90, 0.76, 0.36, 1, b.name); imgui.SameLine()
+                imgui.TextDisabled(string.format("%d kills (%d%% named)", b.tot, math.floor(b.nk / b.tot * 100)))
+            end
             imgui.EndTabItem()
         end
-        if imgui.BeginTabItem((Icons.FA_BOOK or "") .. "  Notes") then
+        imgui.PushStyleColor(ImGuiCol.Text, 0.78, 0.66, 0.98, 1)   -- lavender
+        local notesOpen = imgui.BeginTabItem((Icons.FA_BOOK or "") .. "  Notes")
+        imgui.PopStyleColor()
+        if notesOpen then
             imgui.TextDisabled("  Coming: freeform notes you can jot per zone / camp.")
             imgui.EndTabItem()
         end
-        if imgui.BeginTabItem((Icons.FA_COG or "") .. "  Options") then
+        imgui.PushStyleColor(ImGuiCol.Text, 0.72, 0.72, 0.80, 1)   -- gray
+        local optionsOpen = imgui.BeginTabItem((Icons.FA_COG or "") .. "  Options")
+        imgui.PopStyleColor()
+        if optionsOpen then
             gold("Sounds")
             soundOn = imgui.Checkbox("Sound (master - all CroakWatch sounds)", soundOn)
             -- Camp Watch box shows unchecked (and ignores clicks) while master is off, so master-off
@@ -1537,6 +1839,8 @@ while running do
         rosterRebuild()
         zonePcs, zonePcsList, zonePcsBaseline = {}, {}, false   -- re-adopt the new zone's crowd silently
         watchFeed, watchUnread, watchNewCount = {}, false, 0     -- last camp's OOC/intruder lines are stale
+        selectedName = nil                                       -- close any open detail panel from the old zone
+        editFor, notesDirty = nil, false                         -- drop stale sidebar edit buffers (same-name mob in the new zone must reload)
         lastZone = z
     end
     mq.doevents()

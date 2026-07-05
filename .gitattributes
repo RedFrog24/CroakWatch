@@ -1,5 +1,8 @@
-# Keep dev/CI plumbing out of the release zip (git archive honors export-ignore).
-# Users get exactly: croakwatch/init.lua + croakwatch/assets/ + croakwatch/README.md
+# Keep everything users don't need out of the release zip (git archive honors export-ignore).
+# Users get exactly: croakwatch/init.lua + croakwatch/assets/sounds/*.wav
+# (README.md stays TRACKED - it syncs to the RG resource Overview on each release - but doesn't ship.
+#  Images are not repo-hosted; AL manages RG imagery manually on the site.)
 .github export-ignore
 .gitignore export-ignore
 .gitattributes export-ignore
+README.md export-ignore

@@ -282,12 +282,16 @@
 --        loot event and their vendor Value + Tribute are tallied: session (Loot tab line: coin /
 --        items / tribute) + all-time (Stats > All-Time: item value looted, tribute looted), both
 --        persisted per server.
+-- v1.01: PACKAGING FIX (user-reported "won't load"). The release zip had everything LOOSE at the
+--        root (git archive with no --prefix), so extracting into the lua folder didn't create the
+--        croakwatch/ folder the loader and asset paths require. Zip is now croakwatch/init.lua +
+--        croakwatch/assets/; .gitattributes export-ignores CI/dev files. No code changes.
 
 local mq    = require('mq')
 local imgui = require('ImGui')
 local Icons = require('mq.Icons')
 
-local VERSION  = '1.00'
+local VERSION  = '1.01'
 local myServer = mq.TLO.EverQuest.Server() or ""
 
 local function serverSlug()

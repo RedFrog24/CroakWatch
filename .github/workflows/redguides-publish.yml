@@ -24,7 +24,10 @@ jobs:
           ref: "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.event.release.tag_name }}"
 
       - name: Build zip file
-        run: git archive --format=zip -o "${{ github.event.repository.name }}_${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.event.release.tag_name }}.zip" HEAD
+        # --prefix wraps everything in a croakwatch/ folder (lowercase - the script binds and loads
+        # assets by that exact name), so extracting into the MQ lua folder just works. Without it the
+        # zip contents were LOOSE at the root and /lua run croakwatch found nothing (v1.00 reports).
+        run: git archive --format=zip --prefix=croakwatch/ -o "${{ github.event.repository.name }}_${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.event.release.tag_name }}.zip" HEAD
 
       - name: Write message from workflow input (manual run)
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.message != '' }}

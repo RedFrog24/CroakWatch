@@ -286,12 +286,48 @@
 --        root (git archive with no --prefix), so extracting into the lua folder didn't create the
 --        croakwatch/ folder the loader and asset paths require. Zip is now croakwatch/init.lua +
 --        croakwatch/assets/; .gitattributes export-ignores CI/dev files. No code changes.
+-- v1.02: SLAIN-LINE KILL ATTRIBUTION (formats log-verified on cazic). Kill credit = me + group
+--        members + our pets ("Owner`s warder", EQ backtick); a STRANGER's kill restarts the timer
+--        and feeds respawn learning but is NOT counted (red echo names the killer). New event for
+--        the real cazic form "X was slain by Y!" ("has been slain by" had ZERO log hits - kept for
+--        other servers); victims matched case-insensitively (passive lines capitalize "A ...");
+--        located named get a slain-note the spot poll consumes (12s window) - beats the distance
+--        gate both ways. FIX: "You have slain X!" also matched the "has slain" pattern = silent
+--        DOUBLE-count on unlocated self-kills; cw_you owns it now.
+-- v1.03: PETS kill under their RANDOM name (log truth: "was slain by Vonartik" = the SK pet, not a
+--        stranger - most of a pet group's killing blows!). isOurs now also matches me + each group
+--        member against their LIVE pet's CleanName (Spawn("pc X").Pet, looked up fresh at kill time
+--        since resummons rename). Warder/"`s pet" owner-suffix forms still handled.
+-- v1.04: Recent Croaks shows WHO landed each kill ("18:41 Lasna - Zeneker") - makes the attribution
+--        visible in the UI (nil killer = you / presence-detected, shown plain as before).
+-- v1.05: Recent Croaks = a color-coded camp LEDGER (AL design). Killer names colored by relation:
+--        pets TEAL, group members + mercs SOFT GREEN, outsiders YELLOW - and stranger kills now
+--        ENTER the feed (they were console-only), so an AFK/overnight scan shows at a glance if
+--        someone else was killing your named. isOurs -> killerKind ("self"/"pet"/"grp"/nil);
+--        slain-notes carry the kind; self/presence kills stay plain.
+-- v1.06: STATS TAB v2 (AL design) - collapsible time-horizon sections: Zone Now -> This Session -
+--        Croaks (attribution summary + the FULL scrollable color ledger + an Outsiders-only audit
+--        filter + [zone] tag when an entry is from elsewhere) -> This Session - Loot (session
+--        coin/items/tribute + the full Recent Drops ledger w/ item tooltips) -> All Time ->
+--        Leaderboard. croakLog now PERSISTS (24h reload window, cap 300) - the overnight-AFK audit
+--        survives a crash; dropLog cap 100 (session-only). Front panel gains a one-line attribution
+--        summary (out count YELLOW when > 0). FIX from v1.05: logCroak dropped the kind argument,
+--        so ALL colored croaks fell to soft green - a stranger would have shown green, not yellow.
+-- v1.07: STATS SPACE-FILL (AL mockup-approved) + TOOLTIP-TEACH. Zone Now = one dense line, every
+--        stat explains itself on hover (new project rule: every novel concept ships its tooltip).
+--        This Session MERGED: croak ledger + loot ledger side-by-side halves. All Time = two
+--        columns. Leaderboard rows get relative kill BARS (draw-list, scaled to #1). Ledger rows
+--        now measure their width: too long -> name truncated + the FULL line moves to a hover
+--        tooltip (no horizontal scrollbars); the same tooltip teaches the attribution color.
+-- v1.08: FIX leaderboard tooltip error "invalid option '%n' to 'format'" - SetTooltip printf-formats
+--        its string, and this tooltip contained a literal % ("38% named rate"). Dynamic tooltips now
+--        use a BeginTooltip block (Text does not reformat). Gotcha recorded in root CLAUDE.md.
 
 local mq    = require('mq')
 local imgui = require('ImGui')
 local Icons = require('mq.Icons')
 
-local VERSION  = '1.01'
+local VERSION  = '1.08'
 local myServer = mq.TLO.EverQuest.Server() or ""
 
 local function serverSlug()
@@ -350,6 +386,9 @@ local coinTotal    = 0     -- all-time coin looted (in copper), persisted per se
 local coinSession  = 0     -- this session's coin looted (copper)
 local lootValTotal, lootValSession = 0, 0   -- vendor value of items YOU looted (copper; total persisted)
 local tribTotal, tribSession = 0, 0         -- tribute value of items YOU looted (total persisted)
+local croakLog = {}    -- rolling named-kill ledger (PERSISTED; reloaded with a 24h age filter - the AFK audit)
+local dropLog  = {}    -- session-only rolling feed of loot-line drops
+local sessionCroaks = { self = 0, pet = 0, grp = 0, other = 0 }   -- this session's attribution tallies
 local roster       = {}    -- array of db entries for the current zone (rebuilt on zone change)
 local lootWatch    = {}    -- global per-server list of { item, count }
 local quickReplies = {}    -- per-server preset reply strings (Camp Watch quick-reply)
@@ -469,7 +508,7 @@ local function saveAll()
         }
     end
     mq.pickle(SAVE_FILE, { named = out, loot = lootWatch, replies = quickReplies, coin = coinTotal,
-        itemval = lootValTotal, tribute = tribTotal, schema = 61 })
+        itemval = lootValTotal, tribute = tribTotal, croaks = croakLog, schema = 61 })
 end
 
 local function loadAll()
@@ -512,6 +551,10 @@ local function loadAll()
     coinTotal = saved.coin or 0
     lootValTotal = saved.itemval or 0
     tribTotal    = saved.tribute or 0
+    croakLog = {}   -- reload the kill ledger, keeping only the last 24h (the AFK-audit window)
+    for _, c in ipairs(saved.croaks or {}) do
+        if c.ts and os.time() - c.ts <= 86400 then croakLog[#croakLog + 1] = c end
+    end
     quickReplies = saved.replies or {
         "Camp's taken, sorry", "Yes camping here - welcome to join",
         "Open after my drop", "AFK, back shortly", "Live and camping here",
@@ -663,20 +706,29 @@ local soundFiles = listSounds()
 
 -- Kill + loot detection
 
-local croakLog = {}   -- session-only rolling feed of recent named kills (the Recent Croaks panel)
-local function logCroak(name)
-    croakLog[#croakLog + 1] = { t = os.date("%H:%M"), name = name }
-    if #croakLog > 30 then table.remove(croakLog, 1) end
+-- v1.06 FIX: v1.05's calls passed `kind` but this signature dropped it, so every colored croak fell
+-- to the soft-green branch (a stranger would have shown green, not yellow). Entries also gain ts
+-- (for the 24h reload filter) + zone (shown in the Stats ledger when it differs from current).
+local function logCroak(name, by, kind)
+    croakLog[#croakLog + 1] = { t = os.date("%H:%M"), ts = os.time(), name = name, by = by, kind = kind, zone = curZoneShort }
+    if #croakLog > 300 then table.remove(croakLog, 1) end
+    local k = kind
+    if k ~= "pet" and k ~= "grp" and k ~= "other" then k = "self" end
+    sessionCroaks[k] = sessionCroaks[k] + 1
 end
 
-local dropLog = {}    -- session-only rolling feed of loot-line drops (the Loot tab's Recent Drops)
-
-local function recordKill(e, isNamed)
+-- credited=false records the DEATH for the timer + respawn learning (the clock restarted no matter
+-- who killed it) WITHOUT counting it as our kill. killer names the outsider for the echo/UI.
+-- kind labels the killer for the Recent Croaks colors: "self" | "pet" | "grp" | "other" (stranger).
+local function recordKill(e, isNamed, credited, killer, kind)
+    if credited == nil then credited = true end
     if not isNamed then
         -- v0.61: a placeholder kill feeds the COUNT only. It must not touch killTime or intervals -
         -- the named's clock is named death->death, free of the fast placeholder cadence.
-        e.phKills = e.phKills + 1
-        saveAll()
+        if credited then
+            e.phKills = e.phKills + 1
+            saveAll()
+        end
         return
     end
     if e.killTime then
@@ -686,30 +738,69 @@ local function recordKill(e, isNamed)
             if #e.intervals > 10 then table.remove(e.intervals, 1) end
         end
     end
-    e.killTime   = os.time()
-    e.whoKilled  = "named"
-    e.alerted    = false
-    e.namedKills = e.namedKills + 1
-    logCroak(e.name)   -- feed the Recent Croaks panel (named kills only for now)
-    if not e.hidden then
-        info(string.format("%s \ag[NAMED]\at down - respawn ~%s", e.name, fmtDur((respawnFor(e)))))
+    e.killTime  = os.time()
+    e.whoKilled = credited and "named" or (killer or "another player")
+    e.alerted   = false
+    if credited then
+        e.namedKills = e.namedKills + 1
+        -- self/presence kills show plain; pet/grp finishers show their name in color
+        logCroak(e.name, (kind == "pet" or kind == "grp") and killer or nil, kind)
+        if not e.hidden then
+            info(string.format("%s \ag[NAMED]\at down - respawn ~%s", e.name, fmtDur((respawnFor(e)))))
+        end
+    else
+        logCroak(e.name, killer or "another player", "other")   -- YELLOW in the feed: the AFK-overnight tell
+        if not e.hidden then
+            info(string.format("%s \ar[NAMED]\at down - killed by \ar%s\at (timer restarted, not counted) - respawn ~%s",
+                e.name, killer or "another player", fmtDur((respawnFor(e)))))
+        end
     end
     saveAll()
 end
 
-local function onKill(mobName)
+-- Kill attribution: WHO is this killer to us? Returns "self" | "pet" | "grp" (members + mercs) |
+-- nil (a stranger). Killer names come from the slain lines (log-verified on cazic 2026-07-05):
+--   players + mercs kill under their own name (Group.Member covers both);
+--   warders/some pets as "Owner`s warder" / "Owner`s pet" (EQ BACKTICK, not apostrophe);
+--   MOST pets under their RANDOM generated name (Vonartik/Zeneker...) - matched by looking up each
+--   member's LIVE pet at kill time (fresh every call, since pets get new names on resummon).
+local function killerKind(killer)
+    if not killer or killer == "You" then return "self" end
+    local owner = killer:match("^(.+)`s warder$") or killer:match("^(.+)`s pet$")
+    local kl = (owner or killer):lower()
+    local isPetForm = owner ~= nil
+    if kl == (mq.TLO.Me.CleanName() or ""):lower() then return isPetForm and "pet" or "self" end
+    local myPet = mq.TLO.Me.Pet
+    if (myPet.ID() or 0) > 0 and kl == (myPet.CleanName() or ""):lower() then return "pet" end
+    for i = 1, (mq.TLO.Group.Members() or 0) do
+        local nm = mq.TLO.Group.Member(i).Name()
+        if nm then
+            if nm:lower() == kl then return isPetForm and "pet" or "grp" end
+            local p = mq.TLO.Spawn('pc ' .. nm).Pet   -- member's pet, matched by its raw random name
+            if (p.ID() or 0) > 0 and kl == (p.CleanName() or ""):lower() then return "pet" end
+        end
+    end
+    return nil
+end
+
+local function onKill(mobName, killer)
     if paused then return end
+    local victim = mobName:lower()   -- passive slain lines capitalize the article ("A venomous viper" vs roster "a venomous viper")
+    local kind = killerKind(killer)
+    local credited = kind ~= nil
     for _, e in ipairs(roster) do
-        -- Located named are owned by the loc-gated spot poll (kills credited there), so name-based
-        -- kills are skipped for them - a zone-wide trash mob sharing a PH name can't corrupt the timer.
         if #e.locs == 0 then
-            if mobName == e.name then
-                recordKill(e, true)
-            else
+            if victim == e.name:lower() then
+                recordKill(e, true, credited, killer, kind)
+            elseif credited then   -- PH kills count only when OURS (they don't touch timers since v0.61)
                 for _, ph in ipairs(e.ph) do
-                    if mobName == ph then recordKill(e, false) break end
+                    if victim == ph:lower() then recordKill(e, false) break end
                 end
             end
+        elseif victim == e.name:lower() then
+            -- Located named are timed by the spot poll. Leave it a note about WHO killed, so the
+            -- down-transition can credit us / veto a stranger (consumed within a freshness window).
+            e.slainBy, e.slainKind, e.slainAt = killer or "You", kind, os.time()
         end
     end
 end
@@ -717,7 +808,7 @@ end
 local function onLoot(item, looter, corpse)
     if paused then return end
     dropLog[#dropLog + 1] = { t = os.date("%H:%M"), item = item, who = looter or "?" }
-    if #dropLog > 30 then table.remove(dropLog, 1) end
+    if #dropLog > 100 then table.remove(dropLog, 1) end
     -- Cash + tribute worth of items YOU loot: the item just landed in your bags, so look it up now.
     if looter == "You" then
         local li = mq.TLO.FindItem("=" .. item)
@@ -775,14 +866,23 @@ local function onLoot(item, looter, corpse)
 end
 
 -- #1# captures one word only - multi-word names break it. Use #*# and parse in Lua.
+-- Slain forms (log-verified on cazic 2026-07-05): own kill = "You have slain X!"; everyone else's
+-- (members, pets, strangers) = "X was slain by Y!". The old "has been slain by" form had ZERO log
+-- hits but is kept for servers that use it - an unmatched pattern simply never fires.
 mq.event("cw_you",      "You have slain #*#!",        function(line)
-    local n = line:match("You have slain (.+)!"); if n then onKill(n) end
+    local n = line:match("You have slain (.+)!"); if n then onKill(n, nil) end
+end)
+mq.event("cw_passive2", "#*# was slain by #*#!",      function(line)
+    local n, k = line:match("^(.+) was slain by (.+)!$"); if n then onKill(n, k) end
 end)
 mq.event("cw_passive",  "#*# has been slain by #*#!", function(line)
-    local n = line:match("^(.+) has been slain by "); if n then onKill(n) end
+    local n, k = line:match("^(.+) has been slain by (.+)!$"); if n then onKill(n, k) end
 end)
 mq.event("cw_active",   "#*# has slain #*#!",          function(line)
-    local n = line:match(" has slain (.+)!"); if n then onKill(n) end
+    local k, n = line:match("^(.+) has slain (.+)!$")
+    -- "You have slain X!" ALSO matches this pattern - cw_you owns it (was a silent DOUBLE-count
+    -- on unlocated self-kills before v1.02).
+    if n and k ~= "You" then onKill(n, k) end
 end)
 -- Real EQ loot line: "--You have looted a <item>.--" / "--<name> has looted a <item>.--"
 -- (verified against aquietone/grimmier loot scripts). Coarse #*# filter, parse in Lua so
@@ -905,11 +1005,17 @@ local function pollSpot(e)
         e.spotOccupant, e.spotEmptyTime = nil, nil
     elseif not namedUp and e.isUp then        -- named just went DOWN
         e.isUp = false
-        -- Only a KILL if we were close enough to have done it (see pollByName) - else it's a
-        -- despawn / someone else / out-of-range, and crediting it corrupts kills + the timer.
-        if (e.upDist or 999) <= KILL_RANGE then
-            if not e.killTime or os.time() - e.killTime > 30 then
-                recordKill(e, true)           -- credit + start clock, regardless of what's on the spot
+        -- Attribution (v1.02): a fresh slain-line note beats the distance guess. Ours -> full
+        -- credit; a stranger's kill -> timer restarts + interval learns, but NOT counted as ours.
+        -- No note -> the distance gate as before (close = we plausibly did it; far = despawn/unknown).
+        local fresh = e.slainAt and (os.time() - e.slainAt) <= 12
+        local sb, sKind = fresh and e.slainBy or nil, fresh and e.slainKind or nil
+        e.slainBy, e.slainKind, e.slainAt = nil, nil, nil
+        if not e.killTime or os.time() - e.killTime > 30 then
+            if sb and sKind == nil then
+                recordKill(e, true, false, sb, "other")       -- stranger: clock yes, credit no
+            elseif sKind or (e.upDist or 999) <= KILL_RANGE then
+                recordKill(e, true, true, sb, sKind)          -- ours (confirmed or close enough)
             end
         end
     end
@@ -1057,6 +1163,7 @@ local editOverride, editPH, editSpotRadius, editRoams = 0, "", 0, false
 local editFor = nil                  -- which named the sidebar's inline edit buffers are loaded for
 local notesBuf, notesDirty = "", false
 local lootSort = "added"             -- Loot Watch sort: "added" | "name" | "count"
+local statsCroakFilter = "all"       -- Stats croak ledger filter: "all" | "out" (outsiders only)
 local lootCountCache, lootCountAt = {}, 0   -- inv/bank counts per watched item, refreshed every 5s
 local grpObs = {}                    -- registered DanNet observers, keyed "peer|item"
 local grpCountCache = {}             -- per watched item: { have, total, who } - refreshed from the MAIN loop
@@ -1247,6 +1354,46 @@ local function itemTooltip(name)
         imgui.TextDisabled("not in your inventory or bank - no item data to show")
     end
     imgui.EndTooltip()
+end
+
+-- One croak-ledger row (front panel + Stats). Measures the composed line against the column: too
+-- long -> the NAME is truncated and the tooltip carries the full line (tooltip-only-when-needed,
+-- per AL - no horizontal scrollbars). The tooltip also TEACHES the attribution color.
+local KIND_EXPLAIN = {
+    pet   = "teal = killed by one of your pets",
+    grp   = "green = killed by a group member or merc",
+    other = "YELLOW = killed by someone OUTSIDE your group - worth a look",
+}
+local function croakRow(c, availW)
+    local byStr = c.by and (" - " .. c.by) or ""
+    local zStr  = (c.zone and c.zone ~= curZoneShort) and (" [" .. c.zone .. "]") or ""
+    local full  = c.t .. " " .. c.name .. byStr .. zStr
+    local nm, truncated = c.name, false
+    local fullW = imgui.CalcTextSize(full)
+    if fullW > availW then
+        local nameW   = imgui.CalcTextSize(c.name)
+        local allowed = nameW - (fullW - availW) - 14
+        local keep    = math.max(5, math.floor(#c.name * allowed / math.max(nameW, 1)) - 2)
+        nm, truncated = c.name:sub(1, keep) .. "..", true
+    end
+    imgui.BeginGroup()
+    imgui.TextDisabled(c.t); imgui.SameLine()
+    imgui.TextColored(0.90, 0.76, 0.36, 1, nm)
+    if c.by then
+        imgui.SameLine()
+        if c.kind == "other" then imgui.TextColored(0.95, 0.85, 0.35, 1, "- " .. c.by)      -- YELLOW: outsider
+        elseif c.kind == "pet" then imgui.TextColored(0.45, 0.80, 0.80, 1, "- " .. c.by)    -- teal: our pets
+        else imgui.TextColored(0.55, 0.85, 0.55, 1, "- " .. c.by) end                       -- soft green: group + mercs
+    end
+    if zStr ~= "" then imgui.SameLine(); imgui.TextDisabled(zStr) end
+    imgui.EndGroup()
+    if imgui.IsItemHovered() and (truncated or c.by) then
+        local tip = truncated and full or nil
+        local teach = c.by and KIND_EXPLAIN[c.kind or "grp"] or nil
+        if tip and teach then imgui.SetTooltip(tip .. "\n" .. teach)
+        elseif tip then imgui.SetTooltip(tip)
+        elseif teach then imgui.SetTooltip(teach) end
+    end
 end
 
 -- Master list: one lean clickable line per named (status square + gold name + bar + time).
@@ -1934,10 +2081,15 @@ local function renderMain()
             local halfW = (imgui.GetContentRegionAvailVec().x - 6) * 0.5
             imgui.BeginChild("##croaks", halfW, 0, true)
             imgui.TextColored(0.56, 0.45, 0.84, 1, "RECENT CROAKS")
+            imgui.SameLine()
+            imgui.TextDisabled(string.format(" you %d  pets %d  grp %d", sessionCroaks.self, sessionCroaks.pet, sessionCroaks.grp))
+            imgui.SameLine()
+            if sessionCroaks.other > 0 then imgui.TextColored(0.95, 0.85, 0.35, 1, string.format("out %d", sessionCroaks.other))
+            else imgui.TextDisabled("out 0") end
             if #croakLog == 0 then imgui.TextDisabled("nothing yet this session") end
+            local rowW = imgui.GetContentRegionAvailVec().x
             for i = #croakLog, math.max(1, #croakLog - 2), -1 do   -- 3 lines fit the 100px row without crowding
-                imgui.TextDisabled(croakLog[i].t); imgui.SameLine()
-                imgui.TextColored(0.90, 0.76, 0.36, 1, croakLog[i].name)
+                croakRow(croakLog[i], rowW)
             end
             imgui.EndChild()
             imgui.SameLine()
@@ -2007,63 +2159,153 @@ local function renderMain()
         local statsOpen = imgui.BeginTabItem((Icons.FA_BAR_CHART or "") .. "  Stats")
         imgui.PopStyleColor()
         if statsOpen then
-            imgui.SeparatorText("Camp Overview - this zone")
-            local up, open, soon, later, untimed = 0, 0, 0, 0, 0
-            for _, e in ipairs(roster) do
-                if not e.hidden then
-                    if e.isUp then up = up + 1
-                    elseif e.killTime then
-                        local rem = (respawnFor(e)) - (os.time() - e.killTime)
-                        if rem <= 0 then open = open + 1
-                        elseif rem < 3600 then soon = soon + 1
-                        else later = later + 1 end
-                    else untimed = untimed + 1 end
+            -- Time-horizon layout (v1.06): Zone Now -> This Session -> All Time -> Leaderboard.
+            -- Collapsible so AL shapes his own dashboard; ImGui remembers open states.
+            if imgui.CollapsingHeader("Zone Now", ImGuiTreeNodeFlags.DefaultOpen) then
+                local up, open, soon, later, untimed = 0, 0, 0, 0, 0
+                for _, e in ipairs(roster) do
+                    if not e.hidden then
+                        if e.isUp then up = up + 1
+                        elseif e.killTime then
+                            local rem = (respawnFor(e)) - (os.time() - e.killTime)
+                            if rem <= 0 then open = open + 1
+                            elseif rem < 3600 then soon = soon + 1
+                            else later = later + 1 end
+                        else untimed = untimed + 1 end
+                    end
                 end
-            end
-            imgui.TextColored(0.3, 1.0, 0.3, 1, string.format("Up now: %d", up))
-            imgui.SameLine(140); imgui.TextColored(0.90, 0.45, 0.40, 1, string.format("Window open: %d", open))
-            imgui.TextColored(0.95, 0.85, 0.35, 1, string.format("Due soon (<1h): %d", soon))
-            imgui.SameLine(140); imgui.TextDisabled(string.format("Later: %d", later))
-            imgui.TextDisabled(string.format("No clock yet: %d   (tracked: %d)", untimed, #roster))
-
-            imgui.SeparatorText("All-Time - this server")
-            local tn, tp, zones = 0, 0, {}
-            local bestIt, bestItN = nil, 0
-            for _, e in pairs(db) do
-                tn = tn + (e.namedKills or 0); tp = tp + (e.phKills or 0)
-                zones[e.zone] = true
-                for it, cnt in pairs(e.loot) do
-                    if cnt > bestItN then bestItN, bestIt = cnt, it end
-                end
-            end
-            local zc = 0
-            for _ in pairs(zones) do zc = zc + 1 end
-            imgui.Text(string.format("Croaks: %d   (named %d / PH %d)", tn + tp, tn, tp))
-            imgui.Text(string.format("Zones tracked: %d", zc))
-            imgui.Text("Coin looted: "); imgui.SameLine(0, 0)
-            imgui.TextColored(0.90, 0.76, 0.36, 1, coinStr(coinTotal))
-            imgui.Text("Item value looted: "); imgui.SameLine(0, 0)
-            imgui.TextColored(0.79, 0.63, 0.91, 1, coinStr(lootValTotal))
-            imgui.Text("Tribute looted: "); imgui.SameLine(0, 0)
-            imgui.TextColored(0.45, 0.85, 0.85, 1, tostring(tribTotal))
-            if bestIt then
-                imgui.Text("Top drop: "); imgui.SameLine(0, 0)
-                imgui.TextColored(0.79, 0.63, 0.91, 1, string.format("%s x%d", bestIt, bestItN))
+                -- one dense line; each stat teaches itself on hover (tooltip-teach rule)
+                imgui.TextColored(0.3, 1.0, 0.3, 1, string.format("Up %d", up))
+                if imgui.IsItemHovered() then imgui.SetTooltip("named currently ALIVE in this zone") end
+                imgui.SameLine(0, 14); imgui.TextColored(0.90, 0.45, 0.40, 1, string.format("Open %d", open))
+                if imgui.IsItemHovered() then imgui.SetTooltip("spawn window OPEN - the learned respawn time has\npassed, so the named could pop at any moment") end
+                imgui.SameLine(0, 14); imgui.TextColored(0.95, 0.85, 0.35, 1, string.format("Due <1h %d", soon))
+                if imgui.IsItemHovered() then imgui.SetTooltip("counting down - the spawn window opens within the hour") end
+                imgui.SameLine(0, 14); imgui.TextDisabled(string.format("Later %d", later))
+                if imgui.IsItemHovered() then imgui.SetTooltip("counting down, but more than an hour away") end
+                imgui.SameLine(0, 14); imgui.TextDisabled(string.format("No clock %d  (tracked %d)", untimed, #roster))
+                if imgui.IsItemHovered() then imgui.SetTooltip("no kill seen yet, so no countdown exists -\nkill it (or its placeholder camp) to start the clock") end
             end
 
-            imgui.SeparatorText("Leaderboard - most croaked")
-            local board = {}
-            for _, e in pairs(db) do
-                local tot = (e.namedKills or 0) + (e.phKills or 0)
-                if tot > 0 then board[#board + 1] = { name = e.name, tot = tot, nk = e.namedKills or 0 } end
+            if imgui.CollapsingHeader("This Session", ImGuiTreeNodeFlags.DefaultOpen) then
+                local halfW = (imgui.GetContentRegionAvailVec().x - 8) * 0.5
+                imgui.BeginChild("##sessL", halfW, 178, false)
+                imgui.TextDisabled(string.format("you %d  pets %d  grp %d", sessionCroaks.self, sessionCroaks.pet, sessionCroaks.grp))
+                imgui.SameLine()
+                if sessionCroaks.other > 0 then imgui.TextColored(0.95, 0.85, 0.35, 1, string.format("out %d", sessionCroaks.other))
+                else imgui.TextDisabled("out 0") end
+                if imgui.IsItemHovered() then imgui.SetTooltip("kills by OUTSIDERS (not you/group/pets/mercs) -\nyellow when above zero: someone worked your camps") end
+                imgui.SameLine(0, 12)
+                if imgui.RadioButton("All##scf", statsCroakFilter == "all") then statsCroakFilter = "all" end
+                imgui.SameLine()
+                if imgui.RadioButton("Outsiders##scf", statsCroakFilter == "out") then statsCroakFilter = "out" end
+                if imgui.IsItemHovered() then imgui.SetTooltip("audit view: show ONLY outsider kills -\nthe morning-after AFK check") end
+                imgui.BeginChild("##croakledger", 0, 0, true)
+                local shown = 0
+                local rowW = imgui.GetContentRegionAvailVec().x
+                for i = #croakLog, 1, -1 do   -- ledger keeps 24h (persisted); newest first
+                    local c = croakLog[i]
+                    if statsCroakFilter == "all" or c.kind == "other" then
+                        shown = shown + 1
+                        croakRow(c, rowW)
+                    end
+                end
+                if shown == 0 then
+                    imgui.TextDisabled(statsCroakFilter == "out" and "no outsider kills in the last 24h - camp secure" or "no croaks in the last 24h")
+                end
+                imgui.EndChild()
+                imgui.EndChild()
+                imgui.SameLine()
+                imgui.BeginChild("##sessR", 0, 178, false)
+                imgui.TextDisabled("coin"); imgui.SameLine()
+                imgui.TextColored(0.90, 0.76, 0.36, 1, coinStr(coinSession)); imgui.SameLine()
+                imgui.TextDisabled(" items"); imgui.SameLine()
+                imgui.TextColored(0.79, 0.63, 0.91, 1, coinStr(lootValSession)); imgui.SameLine()
+                imgui.TextDisabled(" tribute"); imgui.SameLine()
+                imgui.TextColored(0.45, 0.85, 0.85, 1, tostring(tribSession))
+                if imgui.IsItemHovered() then imgui.SetTooltip("this session: coin picked up (corpse + splits),\nvendor value of items YOU looted, and their tribute value") end
+                imgui.BeginChild("##dropledger", 0, 0, true)
+                if #dropLog == 0 then imgui.TextDisabled("no drops seen this session") end
+                local dropW = imgui.GetContentRegionAvailVec().x
+                for i = #dropLog, 1, -1 do
+                    local d = dropLog[i]
+                    local full = d.t .. " " .. d.item .. " - " .. d.who
+                    local it = d.item
+                    if imgui.CalcTextSize(full) > dropW then
+                        local itemW = imgui.CalcTextSize(d.item)
+                        local allowed = itemW - (imgui.CalcTextSize(full) - dropW) - 14
+                        it = d.item:sub(1, math.max(5, math.floor(#d.item * allowed / math.max(itemW, 1)) - 2)) .. ".."
+                    end
+                    imgui.TextDisabled(d.t); imgui.SameLine()
+                    imgui.TextColored(0.79, 0.63, 0.91, 1, it)
+                    itemTooltip(d.item)   -- full card carries the full name, so truncation costs nothing
+                    imgui.SameLine(); imgui.TextColored(0.45, 0.80, 0.80, 1, "- " .. d.who)
+                end
+                imgui.EndChild()
+                imgui.EndChild()
             end
-            table.sort(board, function(a, b) return a.tot > b.tot end)
-            if #board == 0 then imgui.TextDisabled("no kills recorded yet") end
-            for i = 1, math.min(#board, 5) do
-                local b = board[i]
-                imgui.TextDisabled(string.format("%d.", i)); imgui.SameLine()
-                imgui.TextColored(0.90, 0.76, 0.36, 1, b.name); imgui.SameLine()
-                imgui.TextDisabled(string.format("%d kills (%d%% named)", b.tot, math.floor(b.nk / b.tot * 100)))
+
+            if imgui.CollapsingHeader("All Time (this server)") then
+                local tn, tp, zones = 0, 0, {}
+                local bestIt, bestItN = nil, 0
+                for _, e in pairs(db) do
+                    tn = tn + (e.namedKills or 0); tp = tp + (e.phKills or 0)
+                    zones[e.zone] = true
+                    for it, cnt in pairs(e.loot) do
+                        if cnt > bestItN then bestItN, bestIt = cnt, it end
+                    end
+                end
+                local zc = 0
+                for _ in pairs(zones) do zc = zc + 1 end
+                -- two columns: kills story left, economics right
+                imgui.Text(string.format("Croaks: %d  (named %d / PH %d)", tn + tp, tn, tp))
+                imgui.SameLine(330); imgui.TextDisabled("Coin looted: "); imgui.SameLine(0, 0)
+                imgui.TextColored(0.90, 0.76, 0.36, 1, coinStr(coinTotal))
+                imgui.Text(string.format("Zones tracked: %d", zc))
+                imgui.SameLine(330); imgui.TextDisabled("Item value: "); imgui.SameLine(0, 0)
+                imgui.TextColored(0.79, 0.63, 0.91, 1, coinStr(lootValTotal))
+                if bestIt then
+                    imgui.Text("Top drop: "); imgui.SameLine(0, 0)
+                    imgui.TextColored(0.79, 0.63, 0.91, 1, string.format("%s x%d", bestIt, bestItN))
+                else
+                    imgui.Text("Top drop: -")
+                end
+                imgui.SameLine(330); imgui.TextDisabled("Tribute: "); imgui.SameLine(0, 0)
+                imgui.TextColored(0.45, 0.85, 0.85, 1, tostring(tribTotal))
+            end
+
+            if imgui.CollapsingHeader("Leaderboard - most croaked") then
+                local board = {}
+                for _, e in pairs(db) do
+                    local tot = (e.namedKills or 0) + (e.phKills or 0)
+                    if tot > 0 then board[#board + 1] = { name = e.name, tot = tot, nk = e.namedKills or 0 } end
+                end
+                table.sort(board, function(a, b) return a.tot > b.tot end)
+                if #board == 0 then imgui.TextDisabled("no kills recorded yet") end
+                local dl = imgui.GetWindowDrawList()
+                for i = 1, math.min(#board, 5) do
+                    local b = board[i]
+                    imgui.TextDisabled(string.format("%d.", i))
+                    imgui.SameLine(28)
+                    local nm = #b.name > 22 and (b.name:sub(1, 22) .. "..") or b.name
+                    imgui.TextColored(0.90, 0.76, 0.36, 1, nm)
+                    imgui.SameLine(228); imgui.TextDisabled(string.format("%d (%d%%)", b.tot, math.floor(b.nk / b.tot * 100)))
+                    -- SetTooltip printf-formats its string, so a literal % inside crashes it
+                    -- ("invalid option '%n'"). Dynamic tooltips use a BeginTooltip block instead.
+                    if imgui.IsItemHovered() then
+                        imgui.BeginTooltip()
+                        imgui.Text(string.format("%s: %d total kills at this camp", b.name, b.tot))
+                        imgui.TextDisabled(string.format("%d were the named itself (%d%% named rate)", b.nk, math.floor(b.nk / b.tot * 100)))
+                        imgui.EndTooltip()
+                    end
+                    imgui.SameLine(320)
+                    local p = imgui.GetCursorScreenPosVec()
+                    local barW = imgui.GetContentRegionAvailVec().x - 8
+                    local frac = b.tot / board[1].tot
+                    dl:AddRectFilled(ImVec2(p.x, p.y + 2), ImVec2(p.x + barW, p.y + 13), IM_COL32(255, 255, 255, 22), 3)
+                    dl:AddRectFilled(ImVec2(p.x, p.y + 2), ImVec2(p.x + barW * frac, p.y + 13), IM_COL32(122, 82, 200, 220), 3)
+                    imgui.Dummy(barW, 15)
+                end
             end
             imgui.EndTabItem()
         end

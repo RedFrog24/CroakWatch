@@ -322,13 +322,53 @@
 -- v1.08: FIX leaderboard tooltip error "invalid option '%n' to 'format'" - SetTooltip printf-formats
 --        its string, and this tooltip contained a literal % ("38% named rate"). Dynamic tooltips now
 --        use a BeginTooltip block (Text does not reformat). Gotcha recorded in root CLAUDE.md.
+-- v1.09: session attribution DONUT in Stats > This Session - a 40px mini-pie of who landed the
+--        session's kills (you purple / pets teal / grp green / outsiders yellow, matching the ledger
+--        colors), with a color-keyed tooltip. Draw-list arcs per the buttonmaster cooldown-pie
+--        pattern (PathLineTo center -> PathArcTo -> PathFillConvex; WindowBg circle punches the hole).
+-- v1.10: This Session layout fix (AL, v1.09 screenshot) - the donut pushed the croak ledger's start
+--        down but the loot half stayed tall (uneven ledger tops), and the one-line economics chain
+--        clipped "tribute" at the half-width. Economics now wraps to two lines (coin+items / tribute
+--        under coin, each with its own tooltip) and the loot ledger's start Y is MEASURED off the
+--        left half's (GetCursorPosY handoff) so both ledgers' tops align exactly - no magic pixels.
+-- v1.11: MONITOR MODE - multi-instance save protection (the bug that ate AL's notes: a second CW
+--        on the same server strip-saves or last-writer-wins the shared config). Instances now find
+--        each other via ACTORS (first actor use in CW): on startup a ping asks "anyone WRITING for
+--        this server on this computer?" - a reply demotes this instance to monitor-only (alerts,
+--        timers, UI all work; saveAll is guard-claused, NOTHING writes). One writer per config
+--        FILE: different server or different PC = no conflict, both run as writers. Monitors stay
+--        monitors for life (no promotion - their memory drifts from the file); the writer sends a
+--        goodbye so monitors warn that kills stop saving. Teal [MONITOR] badge + MON mini-icon.
+--        Manual force: '/lua run croakwatch monitor' or '/croakwatch monitor' (on-only).
+-- v1.12: monitor-mode visibility (AL field test: "I see no Writer or Monitor status on either") -
+--        the WRITER now announces itself at startup too (silence is not a status), and
+--        '/croakwatch status' echoes the role + server + computer any time. Doubles as the
+--        handshake diagnostic.
+-- v1.13: FIX handshake never crossing clients (AL field test: both toons claimed WRITER) - an
+--        address-less actor:send only targets the CURRENT actor's mailbox (same client; verified
+--        vs MQ docs). All three sends now use the explicit { mailbox, script } address, the form
+--        that fans out to every client (the LootNScoot pattern).
+-- v1.14: handshake STILL not crossing (v1.13 field test) - actor transport diagnostics:
+--        '/croakwatch debug' toggles raw echo of every send + every received message (pre-filter),
+--        '/croakwatch ping' broadcasts a test ping on demand, and '/croakwatch status' now shows
+--        a total received-message counter. Zero received on both toons = transport itself.
+-- v1.15: SELF-HEALING handshake. v1.14 diagnostics found the real root cause: actor delivery has
+--        a WARM-UP LAG at script start (Seraane's own self-echo arrived seconds late, long after
+--        the 1.5s window closed - messages are delayed, never lost). A one-shot ping can't survive
+--        that, so the handshake is now continuous: every message carries `since` (script start
+--        time), a new writer ANNOUNCES itself after claiming the role, and when two writers meet
+--        the JUNIOR (later start; name tie-break) demotes itself to monitor on the spot while the
+--        senior re-asserts. Whenever the delayed messages land, the conflict resolves - also fixes
+--        the old accepted simultaneous-start race for free.
 
-local mq    = require('mq')
-local imgui = require('ImGui')
-local Icons = require('mq.Icons')
+local mq     = require('mq')
+local imgui  = require('ImGui')
+local Icons  = require('mq.Icons')
+local actors = require('actors')
 
-local VERSION  = '1.08'
-local myServer = mq.TLO.EverQuest.Server() or ""
+local VERSION   = '1.15'
+local launchArg = ...
+local myServer  = mq.TLO.EverQuest.Server() or ""
 
 local function serverSlug()
     return (myServer:gsub("[^%w]", "")):lower()
@@ -396,6 +436,16 @@ local curAchID     = nil
 local curZoneShort = ""
 local running      = true
 local paused       = false   -- soft pause: loop stays alive, tracking work is gated (RGMercs pattern)
+local monitorMode  = false   -- second instance on this server+computer: alerts work, saveAll is gated
+local handshakeDone = false  -- writers only answer pings after their own handshake settles
+local writerSeen   = false
+local writerName   = ""
+local cwActor      = nil
+local cwDebug      = false   -- '/croakwatch debug': raw echo of every actor send + receive
+local actorMsgCount = 0
+local myStart      = os.time()   -- seniority for writer conflicts: earlier start wins (name tie-break)
+local myComputer   = os.getenv('COMPUTERNAME') or "?"
+local myChar       = mq.TLO.Me.CleanName() or ""
 
 -- Helpers
 
@@ -494,6 +544,7 @@ end
 -- Persistence
 
 local function saveAll()
+    if monitorMode then return end   -- monitor instance: another CW owns this server's file
     local out = {}
     for key, e in pairs(db) do
         out[key] = {
@@ -1942,6 +1993,10 @@ local function renderMain()
     imgui.SameLine(); imgui.TextDisabled("v" .. VERSION)
     imgui.SameLine(); if imgui.SmallButton(paused and "Resume" or "Pause") then paused = not paused end
     if paused then imgui.SameLine(); imgui.TextColored(0.95, 0.40, 0.40, 1, "[PAUSED]") end
+    if monitorMode then
+        imgui.SameLine(); imgui.TextColored(0.45, 0.85, 0.85, 1, "[MONITOR]")
+        if imgui.IsItemHovered() then imgui.SetTooltip("Monitor-only protective mode - another CroakWatch on this\ncomputer owns this server's save file. Alerts, timers and the\nUI all work, but nothing this instance sees or edits is saved.") end
+    end
     -- Custom window controls (no native title bar now): minimize + close, top-right. X stops the
     -- script (as the native X did); _ drops to the mini-icon. NoTitleBar removes native dragging -
     -- by default ImGui still lets you drag empty body space, so the header area should still move it.
@@ -2190,16 +2245,59 @@ local function renderMain()
             if imgui.CollapsingHeader("This Session", ImGuiTreeNodeFlags.DefaultOpen) then
                 local halfW = (imgui.GetContentRegionAvailVec().x - 8) * 0.5
                 imgui.BeginChild("##sessL", halfW, 178, false)
+                -- Session attribution DONUT (buttonmaster's cooldown-pie pattern: PathLineTo center
+                -- -> PathArcTo -> PathFillConvex per wedge, then a WindowBg circle punches the hole).
+                local total = sessionCroaks.self + sessionCroaks.pet + sessionCroaks.grp + sessionCroaks.other
+                local dp = imgui.GetCursorScreenPosVec()
+                local center = ImVec2(dp.x + 21, dp.y + 21)
+                local dl = imgui.GetWindowDrawList()
+                if total > 0 then
+                    local a = -math.pi / 2
+                    local slices = {
+                        { sessionCroaks.self,  IM_COL32(160, 120, 235, 255) },   -- you: purple (accent)
+                        { sessionCroaks.pet,   IM_COL32(115, 204, 204, 255) },   -- pets: teal
+                        { sessionCroaks.grp,   IM_COL32(140, 217, 140, 255) },   -- group/mercs: green
+                        { sessionCroaks.other, IM_COL32(242, 217, 89, 255) },    -- outsiders: yellow
+                    }
+                    for _, s in ipairs(slices) do
+                        if s[1] > 0 then
+                            local a2 = a + (s[1] / total) * 2 * math.pi
+                            dl:PathLineTo(center)
+                            dl:PathArcTo(center, 20, a, a2, 0)
+                            dl:PathFillConvex(s[2])
+                            a = a2
+                        end
+                    end
+                else
+                    dl:AddCircleFilled(center, 20, IM_COL32(120, 108, 140, 60))   -- empty: dim disc
+                end
+                local bg = imgui.GetStyleColorVec4(ImGuiCol.WindowBg)
+                dl:AddCircleFilled(center, 11, imgui.GetColorU32(bg.x, bg.y, bg.z, 1.0))   -- the hole
+                imgui.Dummy(44, 44)
+                if imgui.IsItemHovered() then
+                    imgui.BeginTooltip()
+                    imgui.Text("Session kills by source")
+                    imgui.TextColored(0.63, 0.47, 0.92, 1, string.format("you  %d", sessionCroaks.self))
+                    imgui.TextColored(0.45, 0.80, 0.80, 1, string.format("pets  %d", sessionCroaks.pet))
+                    imgui.TextColored(0.55, 0.85, 0.55, 1, string.format("group/mercs  %d", sessionCroaks.grp))
+                    imgui.TextColored(0.95, 0.85, 0.35, 1, string.format("outsiders  %d", sessionCroaks.other))
+                    imgui.EndTooltip()
+                end
+                imgui.SameLine()
+                imgui.BeginGroup()
                 imgui.TextDisabled(string.format("you %d  pets %d  grp %d", sessionCroaks.self, sessionCroaks.pet, sessionCroaks.grp))
                 imgui.SameLine()
                 if sessionCroaks.other > 0 then imgui.TextColored(0.95, 0.85, 0.35, 1, string.format("out %d", sessionCroaks.other))
                 else imgui.TextDisabled("out 0") end
                 if imgui.IsItemHovered() then imgui.SetTooltip("kills by OUTSIDERS (not you/group/pets/mercs) -\nyellow when above zero: someone worked your camps") end
-                imgui.SameLine(0, 12)
                 if imgui.RadioButton("All##scf", statsCroakFilter == "all") then statsCroakFilter = "all" end
                 imgui.SameLine()
                 if imgui.RadioButton("Outsiders##scf", statsCroakFilter == "out") then statsCroakFilter = "out" end
                 if imgui.IsItemHovered() then imgui.SetTooltip("audit view: show ONLY outsider kills -\nthe morning-after AFK check") end
+                imgui.EndGroup()
+                -- both halves' ledgers should start at the same height; the donut block makes
+                -- this side's header taller, so measure it and hand the Y to the loot side
+                local sessLedgerTop = imgui.GetCursorPosY()
                 imgui.BeginChild("##croakledger", 0, 0, true)
                 local shown = 0
                 local rowW = imgui.GetContentRegionAvailVec().x
@@ -2220,10 +2318,12 @@ local function renderMain()
                 imgui.TextDisabled("coin"); imgui.SameLine()
                 imgui.TextColored(0.90, 0.76, 0.36, 1, coinStr(coinSession)); imgui.SameLine()
                 imgui.TextDisabled(" items"); imgui.SameLine()
-                imgui.TextColored(0.79, 0.63, 0.91, 1, coinStr(lootValSession)); imgui.SameLine()
-                imgui.TextDisabled(" tribute"); imgui.SameLine()
+                imgui.TextColored(0.79, 0.63, 0.91, 1, coinStr(lootValSession))
+                if imgui.IsItemHovered() then imgui.SetTooltip("this session: coin picked up (corpse + splits)\nand the vendor value of items YOU looted") end
+                imgui.TextDisabled("tribute"); imgui.SameLine()
                 imgui.TextColored(0.45, 0.85, 0.85, 1, tostring(tribSession))
-                if imgui.IsItemHovered() then imgui.SetTooltip("this session: coin picked up (corpse + splits),\nvendor value of items YOU looted, and their tribute value") end
+                if imgui.IsItemHovered() then imgui.SetTooltip("tribute value of the items YOU looted this session") end
+                imgui.SetCursorPosY(math.max(imgui.GetCursorPosY(), sessLedgerTop))
                 imgui.BeginChild("##dropledger", 0, 0, true)
                 if #dropLog == 0 then imgui.TextDisabled("no drops seen this session") end
                 local dropW = imgui.GetContentRegionAvailVec().x
@@ -2353,9 +2453,9 @@ local function renderMini()
         for _, e in ipairs(roster) do if e.isUp then up = up + 1 end end
         if paused then imgui.PushStyleColor(ImGuiCol.Text, 0.95, 0.40, 0.40, 1)
         else imgui.PushStyleColor(ImGuiCol.Text, 0.90, 0.76, 0.36, 1) end
-        if imgui.Button(paused and " CW  PAUSED " or string.format(" CW  %d up ", up)) then minimized = false end
+        if imgui.Button(paused and " CW  PAUSED " or string.format(monitorMode and " CW MON  %d up " or " CW  %d up ", up)) then minimized = false end
         imgui.PopStyleColor()
-        if imgui.IsItemHovered() then imgui.SetTooltip("CroakWatch - click to expand") end
+        if imgui.IsItemHovered() then imgui.SetTooltip(monitorMode and "CroakWatch (monitor-only - nothing saves) - click to expand" or "CroakWatch - click to expand") end
         imgui.SameLine()
         if imgui.SmallButton(paused and ">" or "||") then paused = not paused end
         if imgui.IsItemHovered() then imgui.SetTooltip(paused and "Resume tracking" or "Pause tracking") end
@@ -2368,15 +2468,88 @@ local function renderUI()
     if minimized then renderMini() else renderMain() end
 end
 
+-- Monitor-mode handshake (multi-instance save protection). One WRITER per config file: the file
+-- is per-server per-computer, so only a CW on the SAME server AND SAME computer is a conflict -
+-- both filters are load-bearing (actors reach every MQ instance on the network, including other
+-- PCs that write their own files). First instance in = writer; later ones demote to monitor.
+local function cwSend(msg)
+    if cwDebug then info(string.format("actor SEND: id=%s who=%s server=%s computer=%s", msg.id, msg.who, msg.server, msg.computer)) end
+    cwActor:send({ mailbox = 'croakwatch', script = 'croakwatch' }, msg)
+end
+
+local function onCwActor(message)
+    local c = message()
+    actorMsgCount = actorMsgCount + 1
+    if cwDebug then
+        if c then info(string.format("actor RECV #%d: id=%s who=%s server=%s computer=%s", actorMsgCount, tostring(c.id), tostring(c.who), tostring(c.server), tostring(c.computer)))
+        else info(string.format("actor RECV #%d: (nil content)", actorMsgCount)) end
+    end
+    if not c or not c.id or c.who == myChar then return end          -- broadcasts echo back to self
+    if c.server ~= myServer or c.computer ~= myComputer then return end   -- different file: no conflict
+    if c.id == 'cw_ping' and handshakeDone and not monitorMode then
+        cwSend({ id = 'cw_writer', since = myStart, server = myServer, computer = myComputer, who = myChar })
+    elseif c.id == 'cw_writer' then
+        writerSeen, writerName = true, c.who
+        -- Self-healing: actor delivery lags at script start, so two instances can both claim
+        -- writer before each other's messages land. Whenever a writer hears another writer,
+        -- the JUNIOR (later start; name tie-break) demotes; the senior re-asserts so the
+        -- junior hears it even if the original reply was the one that got delayed.
+        if handshakeDone and not monitorMode then
+            local theirs = c.since or 0
+            if theirs < myStart or (theirs == myStart and c.who < myChar) then
+                monitorMode = true
+                warn(string.format("you are already using CW on this computer (\ag%s\at was writing first) - this instance switched to Monitor-only protective mode: alerts and timers work, nothing saves.", c.who))
+            else
+                cwSend({ id = 'cw_writer', since = myStart, server = myServer, computer = myComputer, who = myChar })
+            end
+        end
+    elseif c.id == 'cw_bye' and monitorMode then
+        warn(string.format("the writer (%s) closed CroakWatch - kills from now on will NOT be saved. Restart CroakWatch to become the writer.", c.who))
+    end
+end
+
 mq.bind('/croakwatch', function(arg)
     if arg == 'quit' or arg == 'exit' then running = false
     elseif arg == 'pause' then paused = true
     elseif arg == 'unpause' or arg == 'resume' then paused = false
     elseif arg == 'togglepause' then paused = not paused
+    elseif arg == 'monitor' then   -- ON only: switching a drifted monitor back to writer would clobber the file
+        if monitorMode then info("already in Monitor-only mode.")
+        else monitorMode = true; info("Monitor-only mode ON - alerts and timers work, nothing saves from here on. Restart CroakWatch to become the writer again.") end
+    elseif arg == 'status' then
+        if monitorMode then info(string.format("role: \atMONITOR-ONLY\at (nothing saves)%s - server \ag%s\at, computer \ag%s\at.", writerName ~= "" and string.format(", writer is \ag%s\at", writerName) or "", myServer, myComputer))
+        else info(string.format("role: \agWRITER\at (owns this server's save file) - server \ag%s\at, computer \ag%s\at.", myServer, myComputer)) end
+        info(string.format("actor messages received since start: \ag%d\at.", actorMsgCount))
+    elseif arg == 'debug' then
+        cwDebug = not cwDebug
+        info("actor debug " .. (cwDebug and "ON - every send/receive echoes raw." or "OFF."))
+    elseif arg == 'ping' then
+        cwSend({ id = 'cw_ping', since = myStart, server = myServer, computer = myComputer, who = myChar })
+        info("test ping sent (writers on this server+computer will answer; watch with debug ON).")
     else minimized = not minimized end
 end)
 
 -- Main
+
+cwActor = actors.register('croakwatch', onCwActor)
+if launchArg == 'monitor' then
+    monitorMode = true
+    info("Monitor-only mode forced by launch arg - alerts and timers work, nothing saves.")
+else
+    cwSend({ id = 'cw_ping', since = myStart, server = myServer, computer = myComputer, who = myChar })
+    mq.delay(1500, function() return writerSeen end)
+    if writerSeen then
+        monitorMode = true
+        warn(string.format("you are already using CW on this computer (\ag%s\at is the writer) - this instance is running in Monitor-only protective mode: alerts and timers work, nothing saves.", writerName))
+    else
+        info("this instance is the WRITER for this server's save file (no other CW found on this computer).")
+        -- Announce the claim: actor delivery can lag at startup, so an existing writer may not
+        -- have seen the ping yet. When this announce (or its delayed ping) eventually lands,
+        -- the senior writer asserts itself and the self-healing demotes whoever is junior.
+        cwSend({ id = 'cw_writer', since = myStart, server = myServer, computer = myComputer, who = myChar })
+    end
+end
+handshakeDone = true
 
 loadAll()
 curZoneShort = mq.TLO.Zone.ShortName() or ""
@@ -2423,6 +2596,11 @@ while running do
         if tick % 20 == 0 then refreshGroupCounts() end   -- DanNet group counts, every ~10s
     end
     mq.delay(500)
+end
+
+-- Writer's goodbye: monitors on this server+computer get a heads-up that saving has stopped.
+if not monitorMode then
+    cwSend({ id = 'cw_bye', server = myServer, computer = myComputer, who = myChar })
 end
 
 -- NOTE: deliberately no plugin unload here. Unloading MQTextToSpeech as the script exits crashed

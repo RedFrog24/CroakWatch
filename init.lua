@@ -360,13 +360,62 @@
 --        the JUNIOR (later start; name tie-break) demotes itself to monitor on the spot while the
 --        senior re-asserts. Whenever the delayed messages land, the conflict resolves - also fixes
 --        the old accepted simultaneous-start race for free.
+-- v1.16: Options toggle "Camp Watch lines in console" (AL) - unchecking keeps the intruder
+--        "X entered the zone" lines out of the MQ console; the Camp Watch feed always gets them.
+-- v1.17: NAMED CATALOG - shipped catalog.lua (knowledge in code, separate file keeps init lean;
+--        pcall-required so missing = no catalog). Camps header gains a "Catalog (N)" button when
+--        the current zone is known: checkbox picker (all pre-checked, All/None), already-tracked
+--        named grayed + always skipped - imports NEVER touch learned data. Imported respawns land
+--        as HINTS: new respawnFor rung (override > observed > hint > zone default > fallback),
+--        teal (hint) trust badge with a teach tooltip; own kills outrank the hint at 3 observed.
+--        Seeded: sebilis (classic + HH union, Allakhazam bestiaries 2026-07-08). For EMU/PEQ and
+--        event servers with no achievement. Share-file import/export = the next versions.
+-- v1.18: catalog corrections from AL's REAL save file (field data beats Allakhazam): sebilis
+--        casing fixed to in-game names (myconid spore king / blood of chottal / crypt caretaker
+--        lowercase), 4 named Alla never listed added (froglok chef/repairer/armsman, Gruplinort).
+--        Picker tracked-check now CASE-INSENSITIVE (catTracked) - a casing mismatch would have
+--        offered a duplicate of an already-tracked named. (AL's "empty" roster that prompted the
+--        dig was working as designed - every sebilis entry was hidden=true from HH cleanup.)
+-- v1.19: ERA-AWARE ZONE KEYS (AL's catch: HH mobs share names with classic mobs but are DIFFERENT
+--        content - level ~110 vs ~55, own timers/loot; one shared book pollutes both eras and
+--        "goes haywire" every June). HH zones keep the base ShortName + Zone ID; the DISPLAY name
+--        is the tell ("The Reinforced Ruins of Sebilis") -> zoneKey() appends "#hh" so HH gets its
+--        own book (db keys, roster, timers, loot, ledger tags, catalog lookup all follow
+--        curZoneShort automatically). Orange [HH] header badge, tooltip-taught. One achievement
+--        serves BOTH eras (AL verified 208980 = the classic-named ach; zoneMap[89] exists because
+--        HH renames the zone and breaks the name lookup). Catalog split: sebilis (classic, Alla) +
+--        sebilis#hh (field-verified HH list). Old mixed entries: Remove works on any entry - the
+--        ach repopulates the current era's book cleanly.
+-- v1.20: [HH] badge moved from the title row to after the zone-name line (AL; proximity - a zone
+--        badge belongs with the zone, the title row is for SCRIPT state like [PAUSED]/[MONITOR]).
+-- v1.21: '/croakwatch resetzone' - wipes ALL tracked named for the CURRENT zone book (era-aware:
+--        classic and #hh reset separately) then refills fresh from the achievement when one
+--        exists. Destructive -> two-step: first call arms + warns with the count, 'resetzone
+--        confirm' within 30s executes. Built for the post-HH cleanup case (22 stale hidden
+--        entries) but general-purpose.
+-- v1.22: HELP TAB (AL; modeled on PetGear's) - the slash-command count hit nine with none of
+--        them discoverable. Sections: Commands (purple cmd + dim description), Tips, Version.
+-- v1.23: CATALOG LIFECYCLE (AL's spec) - the button offers itself only where the catalog is the
+--        best source: hidden when the zone HAS an achievement (per-zone capability detection,
+--        not server detection - ach-less Live zones still get it); hidden once you've REVIEWED
+--        the zone's list (Import marks review, per-zone count persisted as `catseen`; Cancel
+--        doesn't); re-offers automatically when a release GROWS that zone's list (content count
+--        check, not catalog version - growth elsewhere never nags). Button now counts NEW named,
+--        tooltips split first-time vs update wording, and zone-in gets a one-time-per-session
+--        console pointer when an unreviewed offer exists.
 
 local mq     = require('mq')
 local imgui  = require('ImGui')
 local Icons  = require('mq.Icons')
 local actors = require('actors')
+-- Shipped named catalog (catalog.lua next to init.lua) - knowledge for no-achievement servers.
+-- pcall so a missing/broken file just means "no catalog", never a crash.
+local okCatalog, catalog = pcall(require, 'croakwatch.catalog')
+if not okCatalog or type(catalog) ~= 'table' or type(catalog.zones) ~= 'table' then
+    catalog = { version = 0, zones = {} }
+end
 
-local VERSION   = '1.15'
+local VERSION   = '1.23'
 local launchArg = ...
 local myServer  = mq.TLO.EverQuest.Server() or ""
 
@@ -443,6 +492,9 @@ local writerName   = ""
 local cwActor      = nil
 local cwDebug      = false   -- '/croakwatch debug': raw echo of every actor send + receive
 local actorMsgCount = 0
+local resetZoneArmed = 0     -- gettime() of the last '/croakwatch resetzone' warning (30s confirm window)
+local catalogSeen  = {}      -- per-zone catalog review marker: [zonebook] = entry count at last Import (persisted)
+local catalogNoticed = {}    -- session-only: zones already given the one-time console notice
 local myStart      = os.time()   -- seniority for writer conflicts: earlier start wins (name tie-break)
 local myComputer   = os.getenv('COMPUTERNAME') or "?"
 local myChar       = mq.TLO.Me.CleanName() or ""
@@ -451,6 +503,16 @@ local myChar       = mq.TLO.Me.CleanName() or ""
 
 local function dbKey(zone, name)
     return zone .. "|" .. name
+end
+
+-- Era-aware zone key (v1.19): Hardcore Heritage zones keep the base short name + Zone ID but are
+-- DIFFERENT content (level ~110 vs classic; own timers/loot). The zone display name is the tell
+-- ("The Reinforced Ruins of Sebilis") - HH gets its own book, e.g. "sebilis#hh", so the eras
+-- never pollute each other and the HH book reopens intact next season.
+local function zoneKey()
+    local short = mq.TLO.Zone.ShortName() or ""
+    if short ~= "" and (mq.TLO.Zone.Name() or ""):find("Reinforced") then return short .. "#hh" end
+    return short
 end
 
 local function newEntry(name, achName, zone, manual)
@@ -537,6 +599,8 @@ local function respawnFor(e)
     if e.override and e.override > 0 then return e.override, "override" end
     local obs = observedAvg(e.intervals)
     if obs then return obs, "observed" end
+    -- imported knowledge (catalog / share file) - a starting point, outranked by own observations
+    if e.respawnHint and e.respawnHint > 0 then return e.respawnHint, "hint" end
     if ZONE_RESPAWN[e.zone] then return ZONE_RESPAWN[e.zone], "default" end
     return GLOBAL_RESPAWN, "fallback"
 end
@@ -550,7 +614,7 @@ local function saveAll()
         out[key] = {
             name = e.name, achName = e.achName, zone = e.zone, manual = e.manual,
             ph = e.ph, override = e.override, hidden = e.hidden, locs = e.locs, roams = e.roams,
-            notes = e.notes,
+            notes = e.notes, respawnHint = e.respawnHint,
             killTime = e.killTime, whoKilled = e.whoKilled,
             phKills = e.phKills, namedKills = e.namedKills, intervals = e.intervals,
             spotRadius = e.spotRadius, spotIntervals = e.spotIntervals,
@@ -559,7 +623,7 @@ local function saveAll()
         }
     end
     mq.pickle(SAVE_FILE, { named = out, loot = lootWatch, replies = quickReplies, coin = coinTotal,
-        itemval = lootValTotal, tribute = tribTotal, croaks = croakLog, schema = 61 })
+        itemval = lootValTotal, tribute = tribTotal, croaks = croakLog, catseen = catalogSeen, schema = 61 })
 end
 
 local function loadAll()
@@ -599,6 +663,7 @@ local function loadAll()
         end
     end
     lootWatch = saved.loot or {}
+    catalogSeen = saved.catseen or {}
     coinTotal = saved.coin or 0
     lootValTotal = saved.itemval or 0
     tribTotal    = saved.tribute or 0
@@ -695,6 +760,7 @@ local watchUnread   = false    -- drives the blinking header (set on new event, 
 local watchNewCount = 0        -- count since last acknowledge (the "(N new)" badge)
 local watchOpen     = false    -- footer section expanded?
 local watchSound    = true     -- Camp Watch sound toggle (also gated by global soundOn)
+local watchEcho     = true     -- intruder lines also echo to the MQ console (feed always gets them)
 local lastWatchSound = 0       -- throttle: ms of the last OOC/zone chime (tells bypass it)
 -- Per-event sounds (swap the filenames to any WAV in assets/sounds/).
 local SOUND_DIR  = (((mq.luaDir or '') .. '/croakwatch/assets/sounds/'):gsub('\\', '/'))
@@ -1186,7 +1252,7 @@ local function pollZonePcs()
             if not zonePcs[p.name] then
                 local desc = string.format("%s (%d %s)%s entered the zone", p.name, p.level, p.class,
                     p.guild ~= "" and (" <" .. p.guild .. ">") or "")
-                warn(desc)
+                if watchEcho then warn(desc) end
                 playWav(INTRUDER_WAV)
                 watchPush("zone", desc)
             end
@@ -1270,6 +1336,7 @@ local function trustBadge(e)
     if src == "override" then r, g, b = 0.85, 0.70, 0.32
     elseif src == "spot" then r, g, b = 0.3, 1.0, 0.4
     elseif src == "observed" then r, g, b = 0.4, 0.9, 0.5
+    elseif src == "hint" then r, g, b = 0.45, 0.80, 0.80
     elseif src == "fallback" then r, g, b = 0.9, 0.5, 0.4 end
     imgui.TextDisabled("    respawn ")
     imgui.SameLine(0, 0)
@@ -1280,6 +1347,9 @@ local function trustBadge(e)
     elseif src == "observed" then suffix = string.format("(observed x%d)", #e.intervals)
     else suffix = "(" .. src .. ")" end
     imgui.TextDisabled(suffix)
+    if src == "hint" and imgui.IsItemHovered() then
+        imgui.SetTooltip("respawn imported from the catalog or a share file - a starting\npoint, replaced by your own kills once 3 are observed")
+    end
 end
 
 -- Item hover-tooltip: icon + stats for any item we can find in inventory or bank. Icon drawn from
@@ -1729,6 +1799,101 @@ local function renderAddPopup()
     end
 end
 
+-- Catalog import: one picker for the shipped catalog (share files join it in a later version).
+-- Entries are a plain name string or { name, respawn }. Already-tracked named gray out and are
+-- always skipped - imports never touch the user's learned data.
+local catalogChecks = {}
+
+local function catName(c)
+    return type(c) == "table" and c.name or c
+end
+
+-- Case-insensitive tracked check: save keys carry real in-game casing, catalog casing may
+-- differ - a plain db[key] miss would offer a duplicate of an already-tracked named.
+local function catTracked(nm)
+    local want = (curZoneShort .. "|" .. nm):lower()
+    for key in pairs(db) do
+        if key:lower() == want then return true end
+    end
+    return false
+end
+
+-- Catalog lifecycle (AL's spec, v1.23): offer the button only where the catalog is the BEST
+-- source (no achievement - per-zone capability detection, not server detection), only while it
+-- brings named you don't track, and only until you've REVIEWED the current list (Import marks
+-- review; Cancel doesn't). A release that grows the zone's list re-offers automatically - the
+-- check is per-zone CONTENT count, not catalog version, so growth elsewhere never nags here.
+local function catalogOffer()
+    if curAchID then return nil, 0 end
+    local list = catalog.zones[curZoneShort]
+    if not list or #list == 0 then return nil, 0 end
+    if #list <= (catalogSeen[curZoneShort] or 0) then return nil, 0 end
+    local have = {}
+    for key in pairs(db) do have[key:lower()] = true end
+    local untracked = 0
+    for _, c in ipairs(list) do
+        if not have[(curZoneShort .. "|" .. catName(c)):lower()] then untracked = untracked + 1 end
+    end
+    if untracked == 0 then return nil, 0 end
+    return list, untracked
+end
+
+-- One-time-per-session console pointer when a zone has an unreviewed catalog offer.
+local function catalogNotice()
+    local _, n = catalogOffer()
+    if n > 0 and not catalogNoticed[curZoneShort] then
+        catalogNoticed[curZoneShort] = true
+        info(string.format("the catalog knows \ag%d\at named for this zone - Camps > \agCatalog\at to review and import.", n))
+    end
+end
+
+local function renderCatalogPopup()
+    if imgui.BeginPopup("catalogimport") then
+        local list = catalog.zones[curZoneShort] or {}
+        gold(string.format("Catalog - %s", curZoneShort))
+        imgui.TextDisabled("check what you camp; grayed named are already tracked")
+        imgui.Separator()
+        imgui.BeginChild("##catlist", 260, 300, false)
+        for i, c in ipairs(list) do
+            local nm = catName(c)
+            if catTracked(nm) then
+                imgui.TextDisabled("   " .. nm .. "  (tracked)")
+            else
+                if catalogChecks[i] == nil then catalogChecks[i] = true end
+                catalogChecks[i] = imgui.Checkbox(nm .. "##cat" .. i, catalogChecks[i])
+            end
+        end
+        imgui.EndChild()
+        if imgui.SmallButton("All##cat") then for i in ipairs(list) do catalogChecks[i] = true end end
+        imgui.SameLine()
+        if imgui.SmallButton("None##cat") then for i in ipairs(list) do catalogChecks[i] = false end end
+        imgui.Separator()
+        if imgui.Button("Import checked##cat") then
+            local added = 0
+            for i, c in ipairs(list) do
+                local nm  = catName(c)
+                local key = dbKey(curZoneShort, nm)
+                if catalogChecks[i] and not catTracked(nm) then
+                    local e = newEntry(nm, nm, curZoneShort, true)
+                    if type(c) == "table" and c.respawn then e.respawnHint = c.respawn end
+                    db[key] = e
+                    added = added + 1
+                end
+            end
+            catalogSeen[curZoneShort] = #list   -- reviewed: offer hides until this zone's list grows
+            saveAll()
+            if added > 0 then
+                rosterRebuild()
+                info(string.format("imported \ag%d\at named from the catalog for \ag%s\at", added, curZoneShort))
+            end
+            imgui.CloseCurrentPopup()
+        end
+        imgui.SameLine()
+        if imgui.Button("Cancel##cat") then imgui.CloseCurrentPopup() end
+        imgui.EndPopup()
+    end
+end
+
 -- Group counts for Loot Watch via DanNet observers. Register once per (peer, item); values arrive
 -- async and are READ from the cache - the refresh runs on the MAIN loop cadence, never in render.
 local function dropGroupObservers(item)
@@ -2006,6 +2171,10 @@ local function renderMain()
     imgui.SameLine()
     if imgui.SmallButton("X##close") then running = false end
     imgui.TextDisabled(string.format("%s  -  %s", mq.TLO.Zone.Name() or "?", myServer ~= "" and myServer or "?"))
+    if curZoneShort:find("#hh", 1, true) then   -- zone badge lives with the zone line (proximity)
+        imgui.SameLine(); imgui.TextColored(0.95, 0.65, 0.30, 1, "[HH]")
+        if imgui.IsItemHovered() then imgui.SetTooltip("Hardcore Heritage zone - same zone, DIFFERENT mobs (level-scaled\nevent versions). CroakWatch keeps a separate book for the HH era:\nits own named, timers and loot, reopened intact each HH season.\nThe classic zone's data is untouched.") end
+    end
     zoneWatch = imgui.Checkbox("##zonewatch", zoneWatch)
     if imgui.IsItemHovered() then imgui.SetTooltip("Zone watch - alert when non-group players enter the zone") end
     imgui.SameLine()
@@ -2078,7 +2247,23 @@ local function renderMain()
                 imgui.SameLine()
                 if imgui.SmallButton("Load from Ach") then loadFromAchievement() end
             end
+            local catList, catNew = catalogOffer()
+            if catList then
+                imgui.SameLine()
+                if imgui.SmallButton(string.format("Catalog (%d)", catNew)) then
+                    catalogChecks = {}   -- fresh open: everything defaults to checked
+                    imgui.OpenPopup("catalogimport")
+                end
+                if imgui.IsItemHovered() then
+                    if catalogSeen[curZoneShort] then
+                        imgui.SetTooltip("the catalog has NEW named for this zone since your last look -\nopen to review and import (never touches named you already track)")
+                    else
+                        imgui.SetTooltip("first-time import: a starter named list for this zone (no\nachievement here, so the catalog fills the gap). Never touches\nnamed you already track; imported respawns are hints your own\nkills replace. Import hides this button until the list grows.")
+                    end
+                end
+            end
             renderAddPopup()
+            renderCatalogPopup()
 
             local vis = {}
             for _, e in ipairs(roster) do
@@ -2426,10 +2611,42 @@ local function renderMain()
             -- reads as "both off". The watchSound preference is kept + restored when master returns.
             local newWatch = imgui.Checkbox("Camp Watch sound (tell / OOC chime)", soundOn and watchSound)
             if soundOn then watchSound = newWatch end
+            watchEcho = imgui.Checkbox("Camp Watch lines in console", watchEcho)
+            if imgui.IsItemHovered() then imgui.SetTooltip("also echo 'X entered the zone' lines to the MQ console -\nuncheck to keep them ONLY in the Camp Watch feed below") end
             renderSoundTest()
             imgui.Separator()
             gold("Quick Replies")
             renderQuickReplies()
+            imgui.EndTabItem()
+        end
+        imgui.PushStyleColor(ImGuiCol.Text, 0.72, 0.72, 0.80, 1)   -- gray
+        local helpOpen = imgui.BeginTabItem((Icons.FA_QUESTION_CIRCLE or "?") .. "  Help")
+        imgui.PopStyleColor()
+        if helpOpen then
+            local function cmd(c, desc)
+                imgui.TextColored(0.63, 0.47, 0.92, 1, "  " .. c)
+                imgui.SameLine(190); imgui.TextDisabled(desc)
+            end
+            gold("Commands")
+            cmd("/croakwatch", "minimize / restore the window")
+            cmd("/croakwatch quit", "stop the script (same as the X button)")
+            cmd("/croakwatch pause", "pause tracking (unpause / togglepause too)")
+            cmd("/croakwatch status", "role (writer/monitor), server, computer")
+            cmd("/croakwatch monitor", "switch THIS instance to monitor-only (no saves; one-way)")
+            cmd("/croakwatch resetzone", "wipe this zone's book + refill from the achievement (asks to confirm)")
+            cmd("/croakwatch debug", "echo raw actor traffic (troubleshooting)")
+            cmd("/croakwatch ping", "test broadcast to other CW instances")
+            imgui.Separator()
+            gold("Tips")
+            imgui.BulletText("Hover almost anything - badges, colors and numbers explain themselves")
+            imgui.BulletText("Second toon on the same server? Just start CW - it auto-protects your data")
+            imgui.BulletText("No achievement (EMU)? Use the Catalog button in Camps to import named")
+            imgui.BulletText("Hidden mobs still track silently - the Hidden checkbox reveals them")
+            imgui.BulletText("HH / event zones keep their own book - the [HH] badge shows which is open")
+            imgui.Separator()
+            gold("Version")
+            imgui.TextColored(0.63, 0.47, 0.92, 1, "CroakWatch v" .. VERSION)
+            imgui.TextDisabled("Created by RedFrog")
             imgui.EndTabItem()
         end
         imgui.EndTabBar()
@@ -2508,7 +2725,7 @@ local function onCwActor(message)
     end
 end
 
-mq.bind('/croakwatch', function(arg)
+mq.bind('/croakwatch', function(arg, arg2)
     if arg == 'quit' or arg == 'exit' then running = false
     elseif arg == 'pause' then paused = true
     elseif arg == 'unpause' or arg == 'resume' then paused = false
@@ -2526,6 +2743,31 @@ mq.bind('/croakwatch', function(arg)
     elseif arg == 'ping' then
         cwSend({ id = 'cw_ping', since = myStart, server = myServer, computer = myComputer, who = myChar })
         info("test ping sent (writers on this server+computer will answer; watch with debug ON).")
+    elseif arg == 'resetzone' then
+        local prefix = curZoneShort .. "|"
+        if arg2 == 'confirm' then
+            if mq.gettime() - resetZoneArmed > 30000 then
+                warn("resetzone is not armed - run /croakwatch resetzone first, then confirm within 30s.")
+            else
+                resetZoneArmed = 0
+                local removed = 0
+                for key in pairs(db) do
+                    if key:sub(1, #prefix) == prefix then db[key] = nil; removed = removed + 1 end
+                end
+                selectedName, editFor = nil, nil
+                saveAll()
+                if curAchID then loadFromAchievement(true) end   -- refill the book fresh from the ach
+                rosterRebuild()
+                info(string.format("resetzone: removed \ag%d\at named for \ag%s\at; now tracking \ag%d\at (fresh from the achievement, if any).", removed, curZoneShort, #roster))
+            end
+        else
+            local n = 0
+            for key in pairs(db) do
+                if key:sub(1, #prefix) == prefix then n = n + 1 end
+            end
+            resetZoneArmed = mq.gettime()
+            warn(string.format("this will DELETE all \ar%d\at tracked named for \ag%s\at - learned timers, locs, PH lists and per-named loot history included. Type \ag/croakwatch resetzone confirm\at within 30s to proceed.", n, curZoneShort))
+        end
     else minimized = not minimized end
 end)
 
@@ -2552,10 +2794,11 @@ end
 handshakeDone = true
 
 loadAll()
-curZoneShort = mq.TLO.Zone.ShortName() or ""
+curZoneShort = zoneKey()
 refreshAch()
 if curAchID then loadFromAchievement(true) end
 rosterRebuild()
+catalogNotice()
 
 -- Load TTS for spoken Named alerts if it isn't already. We do NOT unload it on exit - unloading a
 -- plugin as the script terminates crashed the EQ client (v0.44, EMU where CW was the one to load it).
@@ -2576,10 +2819,11 @@ refreshGroupCounts()   -- register DanNet observers for watched items right away
 while running do
     local z = mq.TLO.Zone.ID()
     if z ~= lastZone then
-        curZoneShort = mq.TLO.Zone.ShortName() or ""
+        curZoneShort = zoneKey()
         refreshAch()
         if curAchID then loadFromAchievement(true) end
         rosterRebuild()
+        catalogNotice()
         zonePcs, zonePcsList, zonePcsBaseline = {}, {}, false   -- re-adopt the new zone's crowd silently
         watchFeed, watchUnread, watchNewCount = {}, false, 0     -- last camp's OOC/intruder lines are stale
         selectedName = nil                                       -- close any open detail panel from the old zone

@@ -403,6 +403,30 @@
 --        check, not catalog version - growth elsewhere never nags). Button now counts NEW named,
 --        tooltips split first-time vs update wording, and zone-in gets a one-time-per-session
 --        console pointer when an unreviewed offer exists.
+-- v1.24: SHARE EXPORT - '/croakwatch export' + Options > Sharing button write
+--        Config/croakwatch/cw_share_<server>_<date>.lua: the versioned 'cw-share' envelope
+--        (kind/version/server/made/by + zones -> named), carrying KNOWLEDGE only - named, locs,
+--        PH lists, firsthand respawns (override or observed >= 3; imported hints NOT re-exported),
+--        spot radii, grouped by zone book (#hh books included). Kills, loot, coin, notes and
+--        hidden flags never leave home. Import side = next version.
+-- v1.25: export polish (AL field test - export WORKS): character name REMOVED from the share
+--        file (personal; provenance belongs to wherever the file is posted - server + date only),
+--        and the console result now says plainly the file is in your Config/croakwatch folder
+--        (two lines: counts, then filename + folder + what to do with it).
+-- v1.26: SHARE IMPORT - cw_share_*.lua files dropped into Config/croakwatch become sections in
+--        the import picker (scanned at startup, zone change, and Options > Rescan). SANDBOXED
+--        loading: setfenv(chunk, {}) - a .lua file is code, untrusted shares get an empty
+--        environment (data out, nothing else); 'cw-share' kind stamp rejects renamed configs;
+--        other servers' files filtered entirely. Share entries carry locs/PH/spotRadius on
+--        import; respawns land as hints. Share sources ignore the ach gate (a sharer's EXTRA
+--        named are the value even where an ach exists) and disappear once everything they offer
+--        is tracked. Button reads "Import (N)" when shares are in play, "Catalog (N)" otherwise.
+--        Same named in two sources imports once (live tracked-check per entry).
+-- v1.27: FIX "function at line 2273 has more than 60 upvalues" (Lua 5.1 hard limit; v1.26's new
+--        module state pushed renderMain over). Stats + Options tab bodies extracted into
+--        renderStatsTab/renderOptionsTab - each function captures only what it uses; max is now
+--        51. NOTE: dev luac is 5.4 (255-upvalue limit) so 'luac -p' does NOT catch this - check
+--        with 'luac -l' upvalue counts when adding module vars.
 
 local mq     = require('mq')
 local imgui  = require('ImGui')
@@ -415,7 +439,7 @@ if not okCatalog or type(catalog) ~= 'table' or type(catalog.zones) ~= 'table' t
     catalog = { version = 0, zones = {} }
 end
 
-local VERSION   = '1.23'
+local VERSION   = '1.27'
 local launchArg = ...
 local myServer  = mq.TLO.EverQuest.Server() or ""
 
@@ -678,6 +702,39 @@ local function loadAll()
     for _, w in ipairs(lootWatch) do w.count = w.count or 0 end
     if oldSchema < 61 then migrated = true end   -- stamp schema=61 so the v0.61 interval reset runs once
     if migrated then saveAll() end   -- persist the cleanup immediately
+end
+
+-- Share export (v1.24): package this server's camp KNOWLEDGE for other players - named, locs,
+-- PH lists, learned respawns, spot radii, grouped by zone book. NO personal history: kills,
+-- loot, coin, notes and hidden flags stay home. Only firsthand respawns ship (override or
+-- observed >= 3) - imported hints are not re-exported as knowledge. The versioned 'cw-share'
+-- envelope future-carries Camps sections; unknown sections are ignored by older importers.
+local function exportShare()
+    local zones = {}
+    local nZones, nNamed = 0, 0
+    for _, e in pairs(db) do
+        local z = zones[e.zone]
+        if not z then z = { named = {} }; zones[e.zone] = z; nZones = nZones + 1 end
+        local rec = { name = e.name }
+        if #e.locs > 0 then rec.locs = e.locs end
+        if #e.ph > 0 then rec.ph = e.ph end
+        local best = (e.override and e.override > 0) and e.override or observedAvg(e.intervals)
+        if best then rec.respawn = best end
+        if e.spotRadius then rec.spotRadius = e.spotRadius end
+        z.named[#z.named + 1] = rec
+        nNamed = nNamed + 1
+    end
+    if nNamed == 0 then
+        warn("nothing to export - no named tracked on this server yet.")
+        return
+    end
+    -- No exporter identity in the file (v1.25, AL): character name is personal; provenance
+    -- belongs to wherever the file is POSTED, not the payload. Server + date only.
+    local fname = 'cw_share_' .. (serverSlug() ~= "" and serverSlug() or "unknown") .. '_' .. os.date('%Y%m%d') .. '.lua'
+    mq.pickle(CONFIG_DIR .. '/' .. fname, { kind = 'cw-share', version = 1, server = myServer,
+        made = os.date('%Y-%m-%d'), zones = zones })
+    info(string.format("exported \ag%d\at named across \ag%d\at zone books.", nNamed, nZones))
+    info(string.format("file: \ag%s\at - saved in your \agConfig/croakwatch\at folder. Post it; importers drop it into THEIR Config/croakwatch folder.", fname))
 end
 
 -- Achievement roster
@@ -1799,10 +1856,10 @@ local function renderAddPopup()
     end
 end
 
--- Catalog import: one picker for the shipped catalog (share files join it in a later version).
--- Entries are a plain name string or { name, respawn }. Already-tracked named gray out and are
--- always skipped - imports never touch the user's learned data.
-local catalogChecks = {}
+-- Import picker: one popup, several knowledge sources - the shipped catalog + any share files
+-- (v1.26). Entries are a plain name string or a table { name, respawn, locs, ph, spotRadius }.
+-- Already-tracked named gray out and are always skipped - imports never touch learned data.
+local importChecks = {}   -- [sourceIdx][entryIdx] = checked (reset on each popup open)
 
 local function catName(c)
     return type(c) == "table" and c.name or c
@@ -1847,49 +1904,131 @@ local function catalogNotice()
     end
 end
 
-local function renderCatalogPopup()
+-- Share files (v1.26): cw_share_*.lua the user drops into Config/croakwatch. A .lua file is
+-- CODE, so untrusted shares load SANDBOXED - setfenv gives the chunk an EMPTY environment (it
+-- can return data, nothing else; any os/io call inside errors into the pcall). The 'cw-share'
+-- kind stamp rejects non-share files (e.g. a renamed raw config) and other servers' files are
+-- filtered out entirely - no Lazarus timers on cazic.
+local shareFiles = {}
+
+local function loadShare(path)
+    local chunk = loadfile(path)
+    if not chunk then return nil end
+    setfenv(chunk, {})
+    local ok, data = pcall(chunk)
+    if not ok or type(data) ~= 'table' or type(data.zones) ~= 'table' then return nil end
+    if data.kind ~= 'cw-share' then return nil end
+    if (data.server or "") ~= myServer then return nil end
+    return data
+end
+
+local function scanShares()
+    shareFiles = {}
+    if not okLfs then return end
+    pcall(function()
+        for f in lfs.dir(CONFIG_DIR) do
+            if f:lower():match("^cw_share_.*%.lua$") then
+                local data = loadShare(CONFIG_DIR .. '/' .. f)
+                if data then shareFiles[#shareFiles + 1] = { name = f, data = data } end
+            end
+        end
+    end)
+    table.sort(shareFiles, function(a, b) return a.name < b.name end)
+end
+
+-- Sources offered for the current zone book. Catalog keeps its lifecycle gate (no ach +
+-- unreviewed); share sources ignore the ach gate - a sharer's EXTRA named are the value even
+-- where an achievement exists - and disappear naturally once everything they carry is tracked.
+local function importSources()
+    local sources, total = {}, 0
+    local catList, catN = catalogOffer()
+    if catList then
+        sources[#sources + 1] = { label = "Catalog", list = catList, catalog = true }
+        total = total + catN
+    end
+    for _, sf in ipairs(shareFiles) do
+        local zb = sf.data.zones[curZoneShort]
+        if zb and type(zb.named) == "table" and #zb.named > 0 then
+            local n = 0
+            for _, c in ipairs(zb.named) do
+                if not catTracked(catName(c)) then n = n + 1 end
+            end
+            if n > 0 then
+                sources[#sources + 1] = { label = sf.name, list = zb.named }
+                total = total + n
+            end
+        end
+    end
+    return sources, total
+end
+
+local function renderImportPopup()
     if imgui.BeginPopup("catalogimport") then
-        local list = catalog.zones[curZoneShort] or {}
-        gold(string.format("Catalog - %s", curZoneShort))
+        local sources = importSources()
+        gold(string.format("Import named - %s", curZoneShort))
         imgui.TextDisabled("check what you camp; grayed named are already tracked")
         imgui.Separator()
-        imgui.BeginChild("##catlist", 260, 300, false)
-        for i, c in ipairs(list) do
-            local nm = catName(c)
-            if catTracked(nm) then
-                imgui.TextDisabled("   " .. nm .. "  (tracked)")
-            else
-                if catalogChecks[i] == nil then catalogChecks[i] = true end
-                catalogChecks[i] = imgui.Checkbox(nm .. "##cat" .. i, catalogChecks[i])
+        imgui.BeginChild("##implist", 300, 300, false)
+        for s, src in ipairs(sources) do
+            imgui.TextColored(0.90, 0.76, 0.36, 1, src.label)
+            if not src.catalog and imgui.IsItemHovered() then
+                imgui.SetTooltip("a share file from your Config/croakwatch folder - locs,\nplaceholder lists and respawn hints ride along on import")
+            end
+            importChecks[s] = importChecks[s] or {}
+            for i, c in ipairs(src.list) do
+                local nm = catName(c)
+                if catTracked(nm) then
+                    imgui.TextDisabled("   " .. nm .. "  (tracked)")
+                else
+                    if importChecks[s][i] == nil then importChecks[s][i] = true end
+                    importChecks[s][i] = imgui.Checkbox(nm .. "##imp" .. s .. "_" .. i, importChecks[s][i])
+                end
             end
         end
         imgui.EndChild()
-        if imgui.SmallButton("All##cat") then for i in ipairs(list) do catalogChecks[i] = true end end
-        imgui.SameLine()
-        if imgui.SmallButton("None##cat") then for i in ipairs(list) do catalogChecks[i] = false end end
-        imgui.Separator()
-        if imgui.Button("Import checked##cat") then
-            local added = 0
-            for i, c in ipairs(list) do
-                local nm  = catName(c)
-                local key = dbKey(curZoneShort, nm)
-                if catalogChecks[i] and not catTracked(nm) then
-                    local e = newEntry(nm, nm, curZoneShort, true)
-                    if type(c) == "table" and c.respawn then e.respawnHint = c.respawn end
-                    db[key] = e
-                    added = added + 1
-                end
+        if imgui.SmallButton("All##imp") then
+            for s, src in ipairs(sources) do
+                importChecks[s] = importChecks[s] or {}
+                for i in ipairs(src.list) do importChecks[s][i] = true end
             end
-            catalogSeen[curZoneShort] = #list   -- reviewed: offer hides until this zone's list grows
+        end
+        imgui.SameLine()
+        if imgui.SmallButton("None##imp") then
+            for s, src in ipairs(sources) do
+                importChecks[s] = importChecks[s] or {}
+                for i in ipairs(src.list) do importChecks[s][i] = false end
+            end
+        end
+        imgui.Separator()
+        if imgui.Button("Import checked##imp") then
+            local added = 0
+            for s, src in ipairs(sources) do
+                for i, c in ipairs(src.list) do
+                    local nm = catName(c)
+                    -- catTracked re-checked live: the same named offered by two sources imports once
+                    if importChecks[s] and importChecks[s][i] and not catTracked(nm) then
+                        local e = newEntry(nm, nm, curZoneShort, true)
+                        if type(c) == "table" then
+                            if c.respawn then e.respawnHint = c.respawn end
+                            if type(c.locs) == "table" and #c.locs > 0 then e.locs = c.locs end
+                            if type(c.ph) == "table" and #c.ph > 0 then e.ph = c.ph end
+                            if c.spotRadius then e.spotRadius = c.spotRadius end
+                        end
+                        db[dbKey(curZoneShort, nm)] = e
+                        added = added + 1
+                    end
+                end
+                if src.catalog then catalogSeen[curZoneShort] = #src.list end   -- reviewed: hide until the list grows
+            end
             saveAll()
             if added > 0 then
                 rosterRebuild()
-                info(string.format("imported \ag%d\at named from the catalog for \ag%s\at", added, curZoneShort))
+                info(string.format("imported \ag%d\at named for \ag%s\at.", added, curZoneShort))
             end
             imgui.CloseCurrentPopup()
         end
         imgui.SameLine()
-        if imgui.Button("Cancel##cat") then imgui.CloseCurrentPopup() end
+        if imgui.Button("Cancel##imp") then imgui.CloseCurrentPopup() end
         imgui.EndPopup()
     end
 end
@@ -2136,269 +2275,9 @@ local function renderCampWatch()
     end
 end
 
-local function renderMain()
-    local nc, nv = pushTheme()
-    imgui.SetNextWindowSizeConstraints(650, 200, 650, 4000)   -- locked 650 width (was 520) for the master-detail layout; height resizable
-    imgui.SetNextWindowSize(650, 600, ImGuiCond.FirstUseEver)
-    local pOpen, shouldDraw = imgui.Begin("CroakWatch v" .. VERSION .. "##CroakWatch", true,
-        bit32.bor(ImGuiWindowFlags.NoScrollbar, ImGuiWindowFlags.NoTitleBar))
-    if not pOpen then
-        running = false   -- X closes AND stops; use the mini-icon (_) to keep it running
-        imgui.End(); imgui.PopStyleColor(nc); imgui.PopStyleVar(nv)
-        return
-    end
-    if not shouldDraw then
-        imgui.End(); imgui.PopStyleColor(nc); imgui.PopStyleVar(nv)
-        return
-    end
-
-    imgui.PushFont(nil, imgui.GetFontSize() * 1.25)
-    gold("CROAKWATCH")
-    imgui.PopFont()
-    imgui.SameLine(); imgui.TextDisabled("v" .. VERSION)
-    imgui.SameLine(); if imgui.SmallButton(paused and "Resume" or "Pause") then paused = not paused end
-    if paused then imgui.SameLine(); imgui.TextColored(0.95, 0.40, 0.40, 1, "[PAUSED]") end
-    if monitorMode then
-        imgui.SameLine(); imgui.TextColored(0.45, 0.85, 0.85, 1, "[MONITOR]")
-        if imgui.IsItemHovered() then imgui.SetTooltip("Monitor-only protective mode - another CroakWatch on this\ncomputer owns this server's save file. Alerts, timers and the\nUI all work, but nothing this instance sees or edits is saved.") end
-    end
-    -- Custom window controls (no native title bar now): minimize + close, top-right. X stops the
-    -- script (as the native X did); _ drops to the mini-icon. NoTitleBar removes native dragging -
-    -- by default ImGui still lets you drag empty body space, so the header area should still move it.
-    local btnW = imgui.CalcTextSize("X") + imgui.GetStyle().FramePadding.x * 2   -- CalcTextSize returns x,y; first = width
-    imgui.SameLine(imgui.GetWindowWidth() - btnW * 2 - 14)
-    if imgui.SmallButton("_##min") then minimized = true end
-    imgui.SameLine()
-    if imgui.SmallButton("X##close") then running = false end
-    imgui.TextDisabled(string.format("%s  -  %s", mq.TLO.Zone.Name() or "?", myServer ~= "" and myServer or "?"))
-    if curZoneShort:find("#hh", 1, true) then   -- zone badge lives with the zone line (proximity)
-        imgui.SameLine(); imgui.TextColored(0.95, 0.65, 0.30, 1, "[HH]")
-        if imgui.IsItemHovered() then imgui.SetTooltip("Hardcore Heritage zone - same zone, DIFFERENT mobs (level-scaled\nevent versions). CroakWatch keeps a separate book for the HH era:\nits own named, timers and loot, reopened intact each HH season.\nThe classic zone's data is untouched.") end
-    end
-    zoneWatch = imgui.Checkbox("##zonewatch", zoneWatch)
-    if imgui.IsItemHovered() then imgui.SetTooltip("Zone watch - alert when non-group players enter the zone") end
-    imgui.SameLine()
-    if zoneWatch then
-        local n = #zonePcsList
-        if n == 0 then imgui.TextColored(0.42, 0.39, 0.50, 1, "zone clear")
-        elseif n <= 4 then imgui.TextColored(0.91, 0.72, 0.31, 1, string.format("%d in zone", n))
-        else imgui.TextColored(0.88, 0.35, 0.30, 1, string.format("%d in zone", n)) end
-        if imgui.IsItemClicked() and n > 0 then imgui.OpenPopup("zonepcs") end
-        if imgui.IsItemHovered() and n > 0 then   -- quick-glance tooltip (capped so a huge zone stays small)
-            imgui.BeginTooltip()
-            for i, p in ipairs(zonePcsList) do
-                if i > 15 then imgui.TextDisabled(string.format("...and %d more - click to pin + scroll", n - 15)); break end
-                imgui.Text(string.format("%s [%d %s]  %s", p.name, p.level, p.class,
-                    p.guild ~= "" and ("<" .. p.guild .. ">") or "no guild"))
-            end
-            imgui.EndTooltip()
-        end
-        if imgui.BeginPopup("zonepcs") then       -- pinned + scrollable (for crowded zones like PoK)
-            imgui.TextDisabled(string.format("Players in zone: %d (not your group)", #zonePcsList))
-            imgui.TextDisabled("Sort:"); imgui.SameLine()
-            if imgui.RadioButton("Name", zonePcsSort == "name") then zonePcsSort = "name" end
-            imgui.SameLine(); if imgui.RadioButton("Level", zonePcsSort == "level") then zonePcsSort = "level" end
-            imgui.Separator()
-            local sorted = {}
-            for _, p in ipairs(zonePcsList) do sorted[#sorted + 1] = p end
-            if zonePcsSort == "level" then
-                table.sort(sorted, function(a, b)
-                    if a.level ~= b.level then return a.level > b.level end   -- highest first
-                    return a.name:lower() < b.name:lower()
-                end)
-            else
-                table.sort(sorted, function(a, b) return a.name:lower() < b.name:lower() end)
-            end
-            imgui.BeginChild("##zpcs", 300, 300, false)
-            for _, p in ipairs(sorted) do
-                imgui.Text(string.format("%s [%d %s]  %s", p.name, p.level, p.class,
-                    p.guild ~= "" and ("<" .. p.guild .. ">") or "no guild"))
-            end
-            imgui.EndChild()
-            imgui.EndPopup()
-        end
-    else
-        imgui.TextDisabled("zone watch off")
-    end
-    imgui.Separator()
-
-    -- Tab area (everything between the header and the pinned Camp Watch footer). The footer is drawn
-    -- after this child so it stays at the bottom regardless of which tab is active.
-    local footerH = imgui.GetFrameHeightWithSpacing() + 6 + (watchOpen and 132 or 0)   -- slim padding: Camp Watch hugs the true bottom
-    imgui.BeginChild("##tabarea", 0, -footerH, false)
-    if imgui.BeginTabBar("##cwtabs") then
-        imgui.PushStyleColor(ImGuiCol.Text, 0.90, 0.76, 0.36, 1)   -- gold
-        local campsOpen = imgui.BeginTabItem((Icons.FA_PAW or "") .. "  Camps")
-        imgui.PopStyleColor()
-        if campsOpen then
-            imgui.TextDisabled("Sort:"); imgui.SameLine()
-            if imgui.RadioButton("Due", sortMode == "due") then sortMode = "due" end
-            imgui.SameLine(); if imgui.RadioButton("Name", sortMode == "name") then sortMode = "name" end
-            imgui.SameLine(); imgui.TextDisabled(" Show:"); imgui.SameLine()
-            if imgui.RadioButton("All", filterMode == 0) then filterMode = 0 end
-            imgui.SameLine(); if imgui.RadioButton("Up", filterMode == 1) then filterMode = 1 end
-            imgui.SameLine(); if imgui.RadioButton("Need", filterMode == 2) then filterMode = 2 end
-            imgui.SameLine(); showHidden = imgui.Checkbox("Hidden", showHidden)
-            if imgui.SmallButton("+ Add") then
-                addName, addPH, addOverride = "", "", 0
-                imgui.OpenPopup("addnamed")
-            end
-            if curAchID then
-                imgui.SameLine()
-                if imgui.SmallButton("Load from Ach") then loadFromAchievement() end
-            end
-            local catList, catNew = catalogOffer()
-            if catList then
-                imgui.SameLine()
-                if imgui.SmallButton(string.format("Catalog (%d)", catNew)) then
-                    catalogChecks = {}   -- fresh open: everything defaults to checked
-                    imgui.OpenPopup("catalogimport")
-                end
-                if imgui.IsItemHovered() then
-                    if catalogSeen[curZoneShort] then
-                        imgui.SetTooltip("the catalog has NEW named for this zone since your last look -\nopen to review and import (never touches named you already track)")
-                    else
-                        imgui.SetTooltip("first-time import: a starter named list for this zone (no\nachievement here, so the catalog fills the gap). Never touches\nnamed you already track; imported respawns are hints your own\nkills replace. Import hides this button until the list grows.")
-                    end
-                end
-            end
-            renderAddPopup()
-            renderCatalogPopup()
-
-            local vis = {}
-            for _, e in ipairs(roster) do
-                if showHidden or not e.hidden then
-                    local show = true
-                    if filterMode == 1 then show = e.isUp
-                    elseif filterMode == 2 then show = not e.achDone end
-                    if show then vis[#vis + 1] = e end
-                end
-            end
-            if sortMode == "name" then
-                table.sort(vis, function(a, b) return a.name:lower() < b.name:lower() end)
-            else
-                table.sort(vis, function(a, b)
-                    local pa, ra = sortKey(a)
-                    local pb, rb = sortKey(b)
-                    if pa ~= pb then return pa < pb end
-                    return ra < rb
-                end)
-            end
-
-            local selEntry = nil
-            if selectedName then
-                for _, e in ipairs(vis) do if e.name == selectedName then selEntry = e break end end
-            end
-
-            -- List (left, fixed 380) + persistent detail sidebar (right, fills the rest). A bottom
-            -- row below both holds Recent Croaks + Croak Stats.
-            local bottomH = 100
-            imgui.BeginChild("##list", 380, -bottomH, true)
-            if #vis == 0 then
-                if not curAchID and #roster == 0 then
-                    imgui.TextColored(0.90, 0.80, 0.40, 1, "  This zone has no Hunter achievement.")
-                    imgui.TextDisabled("  That's why the list is empty - CroakWatch is working fine.")
-                    imgui.TextDisabled("  Use '+ Add' to track a mob here, or go to a Hunter zone.")
-                else
-                    imgui.TextDisabled("  No named to show.")
-                    imgui.TextDisabled("  Use 'Load from Ach' or '+ Add'.")
-                end
-            end
-            for _, e in ipairs(vis) do renderLeanRow(e) end
-            imgui.EndChild()
-            imgui.SameLine()
-            imgui.BeginChild("##sidebar", 0, -bottomH, true)
-            if selEntry then
-                renderDetail(selEntry)
-            else
-                imgui.Spacing()
-                imgui.TextDisabled("  Select a camp on the left")
-                imgui.TextDisabled("  to see its details.")
-            end
-            imgui.EndChild()
-
-            -- Bottom row: Recent Croaks (named-kill feed) + Croak Stats (all-time, this server)
-            local halfW = (imgui.GetContentRegionAvailVec().x - 6) * 0.5
-            imgui.BeginChild("##croaks", halfW, 0, true)
-            imgui.TextColored(0.56, 0.45, 0.84, 1, "RECENT CROAKS")
-            imgui.SameLine()
-            imgui.TextDisabled(string.format(" you %d  pets %d  grp %d", sessionCroaks.self, sessionCroaks.pet, sessionCroaks.grp))
-            imgui.SameLine()
-            if sessionCroaks.other > 0 then imgui.TextColored(0.95, 0.85, 0.35, 1, string.format("out %d", sessionCroaks.other))
-            else imgui.TextDisabled("out 0") end
-            if #croakLog == 0 then imgui.TextDisabled("nothing yet this session") end
-            local rowW = imgui.GetContentRegionAvailVec().x
-            for i = #croakLog, math.max(1, #croakLog - 2), -1 do   -- 3 lines fit the 100px row without crowding
-                croakRow(croakLog[i], rowW)
-            end
-            imgui.EndChild()
-            imgui.SameLine()
-            imgui.BeginChild("##croakstats", 0, 0, true)
-            imgui.TextColored(0.56, 0.45, 0.84, 1, "CROAK STATS")
-            local tn, tp, mostName, mostN, rsum, rcnt = 0, 0, nil, 0, 0, 0
-            for _, e in pairs(db) do
-                local nk, pk = e.namedKills or 0, e.phKills or 0
-                tn = tn + nk; tp = tp + pk
-                if nk + pk > mostN then mostN = nk + pk; mostName = e.name end
-                local a = observedAvg(e.intervals)
-                if a then rsum = rsum + a; rcnt = rcnt + 1 end
-            end
-            imgui.TextDisabled(string.format("croaks %d  -  named %d / PH %d", tn + tp, tn, tp))
-            if mostName then imgui.TextDisabled(string.format("most: %s (%d)", mostName, mostN)) end
-            if rcnt > 0 then imgui.TextDisabled("avg respawn " .. fmtDur(math.floor(rsum / rcnt))) end
-            imgui.EndChild()
-            imgui.EndTabItem()
-        end
-        imgui.PushStyleColor(ImGuiCol.Text, 0.55, 0.75, 1.0, 1)   -- blue
-        local lootOpen = imgui.BeginTabItem((Icons.FA_DIAMOND or "") .. "  Loot")
-        imgui.PopStyleColor()
-        if lootOpen then
-            imgui.TextDisabled("This session:  coin"); imgui.SameLine()
-            imgui.TextColored(0.90, 0.76, 0.36, 1, coinStr(coinSession)); imgui.SameLine()
-            imgui.TextDisabled("  items"); imgui.SameLine()
-            imgui.TextColored(0.79, 0.63, 0.91, 1, coinStr(lootValSession)); imgui.SameLine()
-            imgui.TextDisabled("  tribute"); imgui.SameLine()
-            imgui.TextColored(0.45, 0.85, 0.85, 1, tostring(tribSession))
-            imgui.SeparatorText("Loot Watch")
-            renderLootWatch()
-
-            imgui.SeparatorText("Recent Drops")
-            if #dropLog == 0 then imgui.TextDisabled("no drops seen this session") end
-            for i = #dropLog, math.max(1, #dropLog - 7), -1 do
-                imgui.TextDisabled(dropLog[i].t); imgui.SameLine()
-                imgui.TextColored(0.79, 0.63, 0.91, 1, dropLog[i].item)
-                itemTooltip(dropLog[i].item)
-                imgui.SameLine(); imgui.TextColored(0.45, 0.80, 0.80, 1, "- " .. dropLog[i].who)
-            end
-
-            imgui.SeparatorText("Top Drops")
-            -- item axis: aggregate every named's per-mob tallies across the server db
-            local agg = {}
-            for _, e in pairs(db) do
-                for it, cnt in pairs(e.loot) do
-                    local a = agg[it]
-                    if not a then a = { it = it, cnt = 0, src = "?", srcN = 0 }; agg[it] = a end
-                    a.cnt = a.cnt + cnt
-                    if cnt > a.srcN then a.srcN, a.src = cnt, e.name end   -- best source mob
-                end
-            end
-            local tops = {}
-            for _, a in pairs(agg) do tops[#tops + 1] = a end
-            table.sort(tops, function(x, y) return x.cnt > y.cnt end)
-            if #tops == 0 then imgui.TextDisabled("no per-named drops recorded yet") end
-            for i = 1, math.min(#tops, 8) do
-                imgui.TextColored(0.3, 1.0, 0.3, 1, "x" .. tops[i].cnt); imgui.SameLine()
-                imgui.TextColored(0.79, 0.63, 0.91, 1, tops[i].it)
-                itemTooltip(tops[i].it)
-                imgui.SameLine()
-                imgui.TextColored(0.90, 0.76, 0.36, 1, "(" .. tops[i].src .. ")")
-            end
-            imgui.EndTabItem()
-        end
-        imgui.PushStyleColor(ImGuiCol.Text, 0.55, 0.88, 0.55, 1)   -- green
-        local statsOpen = imgui.BeginTabItem((Icons.FA_BAR_CHART or "") .. "  Stats")
-        imgui.PopStyleColor()
-        if statsOpen then
+-- Tab bodies extracted (v1.27): Lua 5.1 caps a function at 60 upvalues and renderMain
+-- crossed it as module state grew. Each tab body captures only what IT uses.
+local function renderStatsTab()
             -- Time-horizon layout (v1.06): Zone Now -> This Session -> All Time -> Leaderboard.
             -- Collapsible so AL shapes his own dashboard; ImGui remembers open states.
             if imgui.CollapsingHeader("Zone Now", ImGuiTreeNodeFlags.DefaultOpen) then
@@ -2592,6 +2471,300 @@ local function renderMain()
                     imgui.Dummy(barW, 15)
                 end
             end
+end
+
+local function renderOptionsTab()
+            gold("Sounds")
+            soundOn = imgui.Checkbox("Sound (master - all CroakWatch sounds)", soundOn)
+            -- Camp Watch box shows unchecked (and ignores clicks) while master is off, so master-off
+            -- reads as "both off". The watchSound preference is kept + restored when master returns.
+            local newWatch = imgui.Checkbox("Camp Watch sound (tell / OOC chime)", soundOn and watchSound)
+            if soundOn then watchSound = newWatch end
+            watchEcho = imgui.Checkbox("Camp Watch lines in console", watchEcho)
+            if imgui.IsItemHovered() then imgui.SetTooltip("also echo 'X entered the zone' lines to the MQ console -\nuncheck to keep them ONLY in the Camp Watch feed below") end
+            renderSoundTest()
+            imgui.Separator()
+            gold("Sharing")
+            if imgui.Button("Export camp knowledge") then exportShare() end
+            if imgui.IsItemHovered() then imgui.SetTooltip("writes Config/croakwatch/cw_share_<server>_<date>.lua - named,\nlocs, PH lists and learned respawns from EVERY zone book on this\nserver. NO personal history (kills, loot, coin and notes stay\nhome). Post the file on RG or Discord for others on your server.") end
+            imgui.SameLine()
+            if imgui.Button("Rescan share files") then
+                scanShares()
+                info(string.format("\ag%d\at share file(s) for this server in Config/croakwatch.", #shareFiles))
+            end
+            if imgui.IsItemHovered() then imgui.SetTooltip("dropped a downloaded cw_share file into Config/croakwatch?\nRescan picks it up (also runs at startup and on zone change).\nWrong-server and non-share files are ignored automatically.") end
+            imgui.Separator()
+            gold("Quick Replies")
+            renderQuickReplies()
+end
+
+local function renderMain()
+    local nc, nv = pushTheme()
+    imgui.SetNextWindowSizeConstraints(650, 200, 650, 4000)   -- locked 650 width (was 520) for the master-detail layout; height resizable
+    imgui.SetNextWindowSize(650, 600, ImGuiCond.FirstUseEver)
+    local pOpen, shouldDraw = imgui.Begin("CroakWatch v" .. VERSION .. "##CroakWatch", true,
+        bit32.bor(ImGuiWindowFlags.NoScrollbar, ImGuiWindowFlags.NoTitleBar))
+    if not pOpen then
+        running = false   -- X closes AND stops; use the mini-icon (_) to keep it running
+        imgui.End(); imgui.PopStyleColor(nc); imgui.PopStyleVar(nv)
+        return
+    end
+    if not shouldDraw then
+        imgui.End(); imgui.PopStyleColor(nc); imgui.PopStyleVar(nv)
+        return
+    end
+
+    imgui.PushFont(nil, imgui.GetFontSize() * 1.25)
+    gold("CROAKWATCH")
+    imgui.PopFont()
+    imgui.SameLine(); imgui.TextDisabled("v" .. VERSION)
+    imgui.SameLine(); if imgui.SmallButton(paused and "Resume" or "Pause") then paused = not paused end
+    if paused then imgui.SameLine(); imgui.TextColored(0.95, 0.40, 0.40, 1, "[PAUSED]") end
+    if monitorMode then
+        imgui.SameLine(); imgui.TextColored(0.45, 0.85, 0.85, 1, "[MONITOR]")
+        if imgui.IsItemHovered() then imgui.SetTooltip("Monitor-only protective mode - another CroakWatch on this\ncomputer owns this server's save file. Alerts, timers and the\nUI all work, but nothing this instance sees or edits is saved.") end
+    end
+    -- Custom window controls (no native title bar now): minimize + close, top-right. X stops the
+    -- script (as the native X did); _ drops to the mini-icon. NoTitleBar removes native dragging -
+    -- by default ImGui still lets you drag empty body space, so the header area should still move it.
+    local btnW = imgui.CalcTextSize("X") + imgui.GetStyle().FramePadding.x * 2   -- CalcTextSize returns x,y; first = width
+    imgui.SameLine(imgui.GetWindowWidth() - btnW * 2 - 14)
+    if imgui.SmallButton("_##min") then minimized = true end
+    imgui.SameLine()
+    if imgui.SmallButton("X##close") then running = false end
+    imgui.TextDisabled(string.format("%s  -  %s", mq.TLO.Zone.Name() or "?", myServer ~= "" and myServer or "?"))
+    if curZoneShort:find("#hh", 1, true) then   -- zone badge lives with the zone line (proximity)
+        imgui.SameLine(); imgui.TextColored(0.95, 0.65, 0.30, 1, "[HH]")
+        if imgui.IsItemHovered() then imgui.SetTooltip("Hardcore Heritage zone - same zone, DIFFERENT mobs (level-scaled\nevent versions). CroakWatch keeps a separate book for the HH era:\nits own named, timers and loot, reopened intact each HH season.\nThe classic zone's data is untouched.") end
+    end
+    zoneWatch = imgui.Checkbox("##zonewatch", zoneWatch)
+    if imgui.IsItemHovered() then imgui.SetTooltip("Zone watch - alert when non-group players enter the zone") end
+    imgui.SameLine()
+    if zoneWatch then
+        local n = #zonePcsList
+        if n == 0 then imgui.TextColored(0.42, 0.39, 0.50, 1, "zone clear")
+        elseif n <= 4 then imgui.TextColored(0.91, 0.72, 0.31, 1, string.format("%d in zone", n))
+        else imgui.TextColored(0.88, 0.35, 0.30, 1, string.format("%d in zone", n)) end
+        if imgui.IsItemClicked() and n > 0 then imgui.OpenPopup("zonepcs") end
+        if imgui.IsItemHovered() and n > 0 then   -- quick-glance tooltip (capped so a huge zone stays small)
+            imgui.BeginTooltip()
+            for i, p in ipairs(zonePcsList) do
+                if i > 15 then imgui.TextDisabled(string.format("...and %d more - click to pin + scroll", n - 15)); break end
+                imgui.Text(string.format("%s [%d %s]  %s", p.name, p.level, p.class,
+                    p.guild ~= "" and ("<" .. p.guild .. ">") or "no guild"))
+            end
+            imgui.EndTooltip()
+        end
+        if imgui.BeginPopup("zonepcs") then       -- pinned + scrollable (for crowded zones like PoK)
+            imgui.TextDisabled(string.format("Players in zone: %d (not your group)", #zonePcsList))
+            imgui.TextDisabled("Sort:"); imgui.SameLine()
+            if imgui.RadioButton("Name", zonePcsSort == "name") then zonePcsSort = "name" end
+            imgui.SameLine(); if imgui.RadioButton("Level", zonePcsSort == "level") then zonePcsSort = "level" end
+            imgui.Separator()
+            local sorted = {}
+            for _, p in ipairs(zonePcsList) do sorted[#sorted + 1] = p end
+            if zonePcsSort == "level" then
+                table.sort(sorted, function(a, b)
+                    if a.level ~= b.level then return a.level > b.level end   -- highest first
+                    return a.name:lower() < b.name:lower()
+                end)
+            else
+                table.sort(sorted, function(a, b) return a.name:lower() < b.name:lower() end)
+            end
+            imgui.BeginChild("##zpcs", 300, 300, false)
+            for _, p in ipairs(sorted) do
+                imgui.Text(string.format("%s [%d %s]  %s", p.name, p.level, p.class,
+                    p.guild ~= "" and ("<" .. p.guild .. ">") or "no guild"))
+            end
+            imgui.EndChild()
+            imgui.EndPopup()
+        end
+    else
+        imgui.TextDisabled("zone watch off")
+    end
+    imgui.Separator()
+
+    -- Tab area (everything between the header and the pinned Camp Watch footer). The footer is drawn
+    -- after this child so it stays at the bottom regardless of which tab is active.
+    local footerH = imgui.GetFrameHeightWithSpacing() + 6 + (watchOpen and 132 or 0)   -- slim padding: Camp Watch hugs the true bottom
+    imgui.BeginChild("##tabarea", 0, -footerH, false)
+    if imgui.BeginTabBar("##cwtabs") then
+        imgui.PushStyleColor(ImGuiCol.Text, 0.90, 0.76, 0.36, 1)   -- gold
+        local campsOpen = imgui.BeginTabItem((Icons.FA_PAW or "") .. "  Camps")
+        imgui.PopStyleColor()
+        if campsOpen then
+            imgui.TextDisabled("Sort:"); imgui.SameLine()
+            if imgui.RadioButton("Due", sortMode == "due") then sortMode = "due" end
+            imgui.SameLine(); if imgui.RadioButton("Name", sortMode == "name") then sortMode = "name" end
+            imgui.SameLine(); imgui.TextDisabled(" Show:"); imgui.SameLine()
+            if imgui.RadioButton("All", filterMode == 0) then filterMode = 0 end
+            imgui.SameLine(); if imgui.RadioButton("Up", filterMode == 1) then filterMode = 1 end
+            imgui.SameLine(); if imgui.RadioButton("Need", filterMode == 2) then filterMode = 2 end
+            imgui.SameLine(); showHidden = imgui.Checkbox("Hidden", showHidden)
+            if imgui.SmallButton("+ Add") then
+                addName, addPH, addOverride = "", "", 0
+                imgui.OpenPopup("addnamed")
+            end
+            if curAchID then
+                imgui.SameLine()
+                if imgui.SmallButton("Load from Ach") then loadFromAchievement() end
+            end
+            local impSources, impNew = importSources()
+            if #impSources > 0 then
+                imgui.SameLine()
+                local catalogOnly = #impSources == 1 and impSources[1].catalog
+                if imgui.SmallButton(string.format(catalogOnly and "Catalog (%d)" or "Import (%d)", impNew)) then
+                    importChecks = {}   -- fresh open: everything defaults to checked
+                    imgui.OpenPopup("catalogimport")
+                end
+                if imgui.IsItemHovered() then
+                    if not catalogOnly then
+                        imgui.SetTooltip("named on offer from the catalog and/or share files in your\nConfig/croakwatch folder - open to review and import. Never\ntouches named you already track; imported respawns are hints\nyour own kills replace.")
+                    elseif catalogSeen[curZoneShort] then
+                        imgui.SetTooltip("the catalog has NEW named for this zone since your last look -\nopen to review and import (never touches named you already track)")
+                    else
+                        imgui.SetTooltip("first-time import: a starter named list for this zone (no\nachievement here, so the catalog fills the gap). Never touches\nnamed you already track; imported respawns are hints your own\nkills replace. Import hides this button until the list grows.")
+                    end
+                end
+            end
+            renderAddPopup()
+            renderImportPopup()
+
+            local vis = {}
+            for _, e in ipairs(roster) do
+                if showHidden or not e.hidden then
+                    local show = true
+                    if filterMode == 1 then show = e.isUp
+                    elseif filterMode == 2 then show = not e.achDone end
+                    if show then vis[#vis + 1] = e end
+                end
+            end
+            if sortMode == "name" then
+                table.sort(vis, function(a, b) return a.name:lower() < b.name:lower() end)
+            else
+                table.sort(vis, function(a, b)
+                    local pa, ra = sortKey(a)
+                    local pb, rb = sortKey(b)
+                    if pa ~= pb then return pa < pb end
+                    return ra < rb
+                end)
+            end
+
+            local selEntry = nil
+            if selectedName then
+                for _, e in ipairs(vis) do if e.name == selectedName then selEntry = e break end end
+            end
+
+            -- List (left, fixed 380) + persistent detail sidebar (right, fills the rest). A bottom
+            -- row below both holds Recent Croaks + Croak Stats.
+            local bottomH = 100
+            imgui.BeginChild("##list", 380, -bottomH, true)
+            if #vis == 0 then
+                if not curAchID and #roster == 0 then
+                    imgui.TextColored(0.90, 0.80, 0.40, 1, "  This zone has no Hunter achievement.")
+                    imgui.TextDisabled("  That's why the list is empty - CroakWatch is working fine.")
+                    imgui.TextDisabled("  Use '+ Add' to track a mob here, or go to a Hunter zone.")
+                else
+                    imgui.TextDisabled("  No named to show.")
+                    imgui.TextDisabled("  Use 'Load from Ach' or '+ Add'.")
+                end
+            end
+            for _, e in ipairs(vis) do renderLeanRow(e) end
+            imgui.EndChild()
+            imgui.SameLine()
+            imgui.BeginChild("##sidebar", 0, -bottomH, true)
+            if selEntry then
+                renderDetail(selEntry)
+            else
+                imgui.Spacing()
+                imgui.TextDisabled("  Select a camp on the left")
+                imgui.TextDisabled("  to see its details.")
+            end
+            imgui.EndChild()
+
+            -- Bottom row: Recent Croaks (named-kill feed) + Croak Stats (all-time, this server)
+            local halfW = (imgui.GetContentRegionAvailVec().x - 6) * 0.5
+            imgui.BeginChild("##croaks", halfW, 0, true)
+            imgui.TextColored(0.56, 0.45, 0.84, 1, "RECENT CROAKS")
+            imgui.SameLine()
+            imgui.TextDisabled(string.format(" you %d  pets %d  grp %d", sessionCroaks.self, sessionCroaks.pet, sessionCroaks.grp))
+            imgui.SameLine()
+            if sessionCroaks.other > 0 then imgui.TextColored(0.95, 0.85, 0.35, 1, string.format("out %d", sessionCroaks.other))
+            else imgui.TextDisabled("out 0") end
+            if #croakLog == 0 then imgui.TextDisabled("nothing yet this session") end
+            local rowW = imgui.GetContentRegionAvailVec().x
+            for i = #croakLog, math.max(1, #croakLog - 2), -1 do   -- 3 lines fit the 100px row without crowding
+                croakRow(croakLog[i], rowW)
+            end
+            imgui.EndChild()
+            imgui.SameLine()
+            imgui.BeginChild("##croakstats", 0, 0, true)
+            imgui.TextColored(0.56, 0.45, 0.84, 1, "CROAK STATS")
+            local tn, tp, mostName, mostN, rsum, rcnt = 0, 0, nil, 0, 0, 0
+            for _, e in pairs(db) do
+                local nk, pk = e.namedKills or 0, e.phKills or 0
+                tn = tn + nk; tp = tp + pk
+                if nk + pk > mostN then mostN = nk + pk; mostName = e.name end
+                local a = observedAvg(e.intervals)
+                if a then rsum = rsum + a; rcnt = rcnt + 1 end
+            end
+            imgui.TextDisabled(string.format("croaks %d  -  named %d / PH %d", tn + tp, tn, tp))
+            if mostName then imgui.TextDisabled(string.format("most: %s (%d)", mostName, mostN)) end
+            if rcnt > 0 then imgui.TextDisabled("avg respawn " .. fmtDur(math.floor(rsum / rcnt))) end
+            imgui.EndChild()
+            imgui.EndTabItem()
+        end
+        imgui.PushStyleColor(ImGuiCol.Text, 0.55, 0.75, 1.0, 1)   -- blue
+        local lootOpen = imgui.BeginTabItem((Icons.FA_DIAMOND or "") .. "  Loot")
+        imgui.PopStyleColor()
+        if lootOpen then
+            imgui.TextDisabled("This session:  coin"); imgui.SameLine()
+            imgui.TextColored(0.90, 0.76, 0.36, 1, coinStr(coinSession)); imgui.SameLine()
+            imgui.TextDisabled("  items"); imgui.SameLine()
+            imgui.TextColored(0.79, 0.63, 0.91, 1, coinStr(lootValSession)); imgui.SameLine()
+            imgui.TextDisabled("  tribute"); imgui.SameLine()
+            imgui.TextColored(0.45, 0.85, 0.85, 1, tostring(tribSession))
+            imgui.SeparatorText("Loot Watch")
+            renderLootWatch()
+
+            imgui.SeparatorText("Recent Drops")
+            if #dropLog == 0 then imgui.TextDisabled("no drops seen this session") end
+            for i = #dropLog, math.max(1, #dropLog - 7), -1 do
+                imgui.TextDisabled(dropLog[i].t); imgui.SameLine()
+                imgui.TextColored(0.79, 0.63, 0.91, 1, dropLog[i].item)
+                itemTooltip(dropLog[i].item)
+                imgui.SameLine(); imgui.TextColored(0.45, 0.80, 0.80, 1, "- " .. dropLog[i].who)
+            end
+
+            imgui.SeparatorText("Top Drops")
+            -- item axis: aggregate every named's per-mob tallies across the server db
+            local agg = {}
+            for _, e in pairs(db) do
+                for it, cnt in pairs(e.loot) do
+                    local a = agg[it]
+                    if not a then a = { it = it, cnt = 0, src = "?", srcN = 0 }; agg[it] = a end
+                    a.cnt = a.cnt + cnt
+                    if cnt > a.srcN then a.srcN, a.src = cnt, e.name end   -- best source mob
+                end
+            end
+            local tops = {}
+            for _, a in pairs(agg) do tops[#tops + 1] = a end
+            table.sort(tops, function(x, y) return x.cnt > y.cnt end)
+            if #tops == 0 then imgui.TextDisabled("no per-named drops recorded yet") end
+            for i = 1, math.min(#tops, 8) do
+                imgui.TextColored(0.3, 1.0, 0.3, 1, "x" .. tops[i].cnt); imgui.SameLine()
+                imgui.TextColored(0.79, 0.63, 0.91, 1, tops[i].it)
+                itemTooltip(tops[i].it)
+                imgui.SameLine()
+                imgui.TextColored(0.90, 0.76, 0.36, 1, "(" .. tops[i].src .. ")")
+            end
+            imgui.EndTabItem()
+        end
+        imgui.PushStyleColor(ImGuiCol.Text, 0.55, 0.88, 0.55, 1)   -- green
+        local statsOpen = imgui.BeginTabItem((Icons.FA_BAR_CHART or "") .. "  Stats")
+        imgui.PopStyleColor()
+        if statsOpen then
+            renderStatsTab()
             imgui.EndTabItem()
         end
         imgui.PushStyleColor(ImGuiCol.Text, 0.78, 0.66, 0.98, 1)   -- lavender
@@ -2605,18 +2778,7 @@ local function renderMain()
         local optionsOpen = imgui.BeginTabItem((Icons.FA_COG or "") .. "  Options")
         imgui.PopStyleColor()
         if optionsOpen then
-            gold("Sounds")
-            soundOn = imgui.Checkbox("Sound (master - all CroakWatch sounds)", soundOn)
-            -- Camp Watch box shows unchecked (and ignores clicks) while master is off, so master-off
-            -- reads as "both off". The watchSound preference is kept + restored when master returns.
-            local newWatch = imgui.Checkbox("Camp Watch sound (tell / OOC chime)", soundOn and watchSound)
-            if soundOn then watchSound = newWatch end
-            watchEcho = imgui.Checkbox("Camp Watch lines in console", watchEcho)
-            if imgui.IsItemHovered() then imgui.SetTooltip("also echo 'X entered the zone' lines to the MQ console -\nuncheck to keep them ONLY in the Camp Watch feed below") end
-            renderSoundTest()
-            imgui.Separator()
-            gold("Quick Replies")
-            renderQuickReplies()
+            renderOptionsTab()
             imgui.EndTabItem()
         end
         imgui.PushStyleColor(ImGuiCol.Text, 0.72, 0.72, 0.80, 1)   -- gray
@@ -2634,6 +2796,7 @@ local function renderMain()
             cmd("/croakwatch status", "role (writer/monitor), server, computer")
             cmd("/croakwatch monitor", "switch THIS instance to monitor-only (no saves; one-way)")
             cmd("/croakwatch resetzone", "wipe this zone's book + refill from the achievement (asks to confirm)")
+            cmd("/croakwatch export", "write a share file of your camp knowledge (no personal history)")
             cmd("/croakwatch debug", "echo raw actor traffic (troubleshooting)")
             cmd("/croakwatch ping", "test broadcast to other CW instances")
             imgui.Separator()
@@ -2743,6 +2906,8 @@ mq.bind('/croakwatch', function(arg, arg2)
     elseif arg == 'ping' then
         cwSend({ id = 'cw_ping', since = myStart, server = myServer, computer = myComputer, who = myChar })
         info("test ping sent (writers on this server+computer will answer; watch with debug ON).")
+    elseif arg == 'export' then
+        exportShare()
     elseif arg == 'resetzone' then
         local prefix = curZoneShort .. "|"
         if arg2 == 'confirm' then
@@ -2798,6 +2963,7 @@ curZoneShort = zoneKey()
 refreshAch()
 if curAchID then loadFromAchievement(true) end
 rosterRebuild()
+scanShares()
 catalogNotice()
 
 -- Load TTS for spoken Named alerts if it isn't already. We do NOT unload it on exit - unloading a
@@ -2823,6 +2989,7 @@ while running do
         refreshAch()
         if curAchID then loadFromAchievement(true) end
         rosterRebuild()
+        scanShares()
         catalogNotice()
         zonePcs, zonePcsList, zonePcsBaseline = {}, {}, false   -- re-adopt the new zone's crowd silently
         watchFeed, watchUnread, watchNewCount = {}, false, 0     -- last camp's OOC/intruder lines are stale

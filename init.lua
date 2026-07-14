@@ -427,6 +427,60 @@
 --        renderStatsTab/renderOptionsTab - each function captures only what it uses; max is now
 --        51. NOTE: dev luac is 5.4 (255-upvalue limit) so 'luac -p' does NOT catch this - check
 --        with 'luac -l' upvalue counts when adding module vars.
+-- v1.28: THEMES + first paint. TurnipBuy-style inline THEMES table (Green Frog default,
+--        Classic = the original text look), dropdown at the top of Options (applies instantly,
+--        persisted per server as `theme`). First shipped art: assets/img/banner_green.png (frog +
+--        mossy wordmark, cropped from AL's GPT art, edge-feathered to alpha so it melts into the
+--        header) drawn 325x96 via the PetGear texture pattern; the info rows group to its right.
+--        Missing art = text header, never a crash. Semantic colors never change per theme.
+-- v1.29: header fill (AL: "way too squished") - banner up to 407x120, and the zone + zone-watch
+--        rows merge onto ONE full-width line BELOW the banner (mockup06's arrangement) instead
+--        of cramming beside it; only version/Pause/badges/_X sit in the banner's side column.
+-- v1.30: THE SQUISH WAS A TEXTURE-PADDING BUG - MQ pads non-power-of-2 images to the next power
+--        of 2 and Image() drew the whole padded canvas (art squeezed top-left, dead space right/
+--        bottom). Asset re-cut to EXACTLY 1024x256 (4:1, bottom trimmed) = zero padding. Banner
+--        now draws FULL WIDTH with controls OVERLAID on the art's dark right side (absolute
+--        SetCursorScreenPos). Also fixes v1.29's vanished _/X: SameLine(x) is GROUP-relative
+--        (measures from the group start, not the window) - right-aligning inside a group lands
+--        off-screen; overlays avoid groups entirely.
+-- v1.31: overlay polish (AL) - version + Pause moved LOW under the wordmark's tail (they sat on
+--        the lettering, unreadable); badges join that bottom row. The FROG is now a minimize
+--        button: InvisibleButton hitbox over the art's left quarter, tooltip-taught.
+-- v1.32: IDLE ART + alignment. Pause/version block right-aligned to the same computed margin as
+--        the _/X buttons (widths measured, never guessed). New asset idle_green.png (512x512
+--        pow2, the stone frog sentinel cropped from AL's GPT sheet) fills the empty detail
+--        sidebar as the biggest centered square that fits - dead space becomes atmosphere.
+--        getBanner generalized to getArt(prefix) - one loader for all themed art.
+-- v1.33: idle art polish (AL) - COVER-FILL: the sentinel now fills the entire empty panel
+--        (UV-crop to the panel's aspect; edges crop instead of the image shrinking), and the
+--        "Select a camp" hint overlays the image on a darkened top band baked into the asset.
+-- v1.34: FROG HEAD icon (froghead_green.png, 128x128 pow2, the boxed badge from the art sheet):
+--        24px on the mini-icon (clickable - expands, same as the button) and 16px beside the
+--        CROAK STATS header. Both no-ops when the theme has no art.
+-- v1.35: PNG-GLYPH technique debut (MQ's bundled icon font has NO skull) - icon_skull.png +
+--        icon_frog.png rendered from the full fa-solid-900.ttf via Pillow, colors baked (header
+--        purple / frog green). Purple skull beside RECENT CROAKS; the boxed frog-head badge on
+--        CROAK STATS replaced with the cleaner frog glyph (badge stays on the mini-icon).
+--        getImg loader added for theme-independent art; getArt now wraps it.
+-- v1.36: ART ATLAS (AL's call, timed before red/blue art lands and while nothing has shipped) -
+--        per-theme pieces merged into ONE atlas_<art>.png (1024x1024 pow2; banner/idle/froghead
+--        at FIXED slots = the layout contract, tools/cw_atlas.py builds them; free canvas
+--        reserved for future pieces) + icons.png (256x64 strip, 64px cells: skull, frog). All
+--        draw sites UV-crop their piece; new themes = one atlas file that matches the template.
+-- v1.37: SWAMP COLORS + assets/images. Green Frog gets its OWN widget palette (mossy greens,
+--        frog-eye gold CheckMark, themed Tab/Header colors - tabs finally get color) instead of
+--        borrowing Classic's purple; THEMES now carries a full color set per theme (pushTheme
+--        reads the active set; names resolve through ImGuiCol so a renamed enum skips, never
+--        crashes) - the pattern Red/Blue will reuse. Classic unchanged. Asset folder renamed
+--        assets/img -> assets/images (AL rule: full word).
+-- v1.38: REDFROG + BLUE FROG themes - atlases cut from AL's labeled GPT sheets (mockup09/10)
+--        via the atlas pipeline (banner feathered, idle top darkened, all pow2 slots), plus
+--        full color sets: RedFrog = blood-swamp w/ ember accents, Blue Frog = deep water w/
+--        ice accents. Four themes in the dropdown; RedFrog is the artist's signature.
+-- v1.39: RedFrog palette v2 (first pass "too much" - now charcoal-wine base, ember accents
+--        only; the ART carries the red) + three art-less CLASSIC color twins (Classic Green/
+--        Red/Blue - color tables shared BY REFERENCE with their art siblings, so a palette
+--        tweak fixes both). Seven themes total.
 
 local mq     = require('mq')
 local imgui  = require('ImGui')
@@ -439,7 +493,7 @@ if not okCatalog or type(catalog) ~= 'table' or type(catalog.zones) ~= 'table' t
     catalog = { version = 0, zones = {} }
 end
 
-local VERSION   = '1.27'
+local VERSION   = '1.39'
 local launchArg = ...
 local myServer  = mq.TLO.EverQuest.Server() or ""
 
@@ -509,6 +563,132 @@ local curAchID     = nil
 local curZoneShort = ""
 local running      = true
 local paused       = false   -- soft pause: loop stays alive, tracking work is gated (RGMercs pattern)
+-- Themes (TurnipBuy-style, inline): each entry names its ART suffix (assets/img/banner_<art>.png
+-- etc.); missing art falls back to the text header, never a crash. Per-theme color overrides
+-- join the table when the RedFrog/Blue Frog variants land - widget colors are shared for now.
+-- Semantic colors (green UP, yellow outsiders, teal hints...) never change per theme.
+local THEME_NAMES = { 'Green Frog', 'RedFrog', 'Blue Frog', 'Classic', 'Classic Green', 'Classic Red', 'Classic Blue' }
+local THEMES = {
+    -- RedFrog v2 (v1.39, first pass read "too much"): charcoal-wine base, ember accents only -
+    -- the ART carries the red; widgets frame it quietly.
+    ['RedFrog'] = { art = 'red', colors = {
+        { 'WindowBg',             0.072, 0.048, 0.052, 1 },
+        { 'TitleBg',              0.095, 0.060, 0.065, 1 },
+        { 'TitleBgActive',        0.140, 0.085, 0.090, 1 },
+        { 'Border',               0.580, 0.340, 0.240, 0.70 },
+        { 'Text',                 0.900, 0.860, 0.840, 1 },
+        { 'Button',               0.260, 0.100, 0.115, 0.9 },
+        { 'ButtonHovered',        0.430, 0.155, 0.160, 1 },
+        { 'ButtonActive',         0.540, 0.210, 0.190, 1 },
+        { 'FrameBg',              0.145, 0.075, 0.082, 1 },
+        { 'FrameBgHovered',       0.220, 0.105, 0.110, 1 },
+        { 'FrameBgActive',        0.290, 0.135, 0.135, 1 },
+        { 'CheckMark',            0.950, 0.480, 0.280, 1 },
+        { 'Separator',            0.450, 0.210, 0.160, 0.5 },
+        { 'ChildBg',              0.058, 0.038, 0.042, 1 },
+        { 'ScrollbarBg',          0.090, 0.055, 0.060, 0.6 },
+        { 'ScrollbarGrab',        0.260, 0.100, 0.115, 0.9 },
+        { 'ScrollbarGrabHovered', 0.430, 0.155, 0.160, 1 },
+        { 'ScrollbarGrabActive',  0.540, 0.210, 0.190, 1 },
+        { 'Tab',                  0.125, 0.065, 0.070, 1 },
+        { 'TabHovered',           0.430, 0.155, 0.160, 1 },
+        { 'TabActive',            0.240, 0.105, 0.105, 1 },
+        { 'TabUnfocused',         0.085, 0.052, 0.056, 1 },
+        { 'TabUnfocusedActive',   0.160, 0.085, 0.088, 1 },
+        { 'Header',               0.200, 0.090, 0.095, 0.7 },
+        { 'HeaderHovered',        0.330, 0.135, 0.135, 0.9 },
+        { 'HeaderActive',         0.430, 0.175, 0.165, 1 },
+        { 'PopupBg',              0.068, 0.044, 0.048, 0.96 },
+    } },
+    -- Deep-water palette for the blue art; ice accents.
+    ['Blue Frog'] = { art = 'blue', colors = {
+        { 'WindowBg',             0.040, 0.060, 0.110, 1 },
+        { 'TitleBg',              0.060, 0.090, 0.150, 1 },
+        { 'TitleBgActive',        0.080, 0.130, 0.220, 1 },
+        { 'Border',               0.300, 0.550, 0.800, 0.85 },
+        { 'Text',                 0.840, 0.890, 0.950, 1 },
+        { 'Button',               0.100, 0.200, 0.380, 0.9 },
+        { 'ButtonHovered',        0.160, 0.340, 0.600, 1 },
+        { 'ButtonActive',         0.220, 0.420, 0.720, 1 },
+        { 'FrameBg',              0.070, 0.130, 0.240, 1 },
+        { 'FrameBgHovered',       0.110, 0.200, 0.350, 1 },
+        { 'FrameBgActive',        0.150, 0.260, 0.440, 1 },
+        { 'CheckMark',            0.550, 0.800, 1.000, 1 },
+        { 'Separator',            0.250, 0.420, 0.620, 0.5 },
+        { 'ChildBg',              0.030, 0.050, 0.085, 1 },
+        { 'ScrollbarBg',          0.050, 0.080, 0.140, 0.6 },
+        { 'ScrollbarGrab',        0.100, 0.200, 0.380, 0.9 },
+        { 'ScrollbarGrabHovered', 0.160, 0.340, 0.600, 1 },
+        { 'ScrollbarGrabActive',  0.220, 0.420, 0.720, 1 },
+        { 'Tab',                  0.070, 0.120, 0.220, 1 },
+        { 'TabHovered',           0.160, 0.340, 0.600, 1 },
+        { 'TabActive',            0.120, 0.230, 0.400, 1 },
+        { 'TabUnfocused',         0.050, 0.090, 0.160, 1 },
+        { 'TabUnfocusedActive',   0.090, 0.160, 0.280, 1 },
+        { 'Header',               0.100, 0.190, 0.330, 0.7 },
+        { 'HeaderHovered',        0.150, 0.290, 0.500, 0.9 },
+        { 'HeaderActive',         0.200, 0.370, 0.620, 1 },
+        { 'PopupBg',              0.035, 0.055, 0.100, 0.96 },
+    } },
+    -- Swamp palette matching the green art: mossy greens, frog-eye gold accents.
+    ['Green Frog'] = { art = 'green', colors = {
+        { 'WindowBg',             0.055, 0.085, 0.050, 1 },
+        { 'TitleBg',              0.070, 0.110, 0.060, 1 },
+        { 'TitleBgActive',        0.100, 0.160, 0.090, 1 },
+        { 'Border',               0.520, 0.620, 0.240, 0.85 },
+        { 'Text',                 0.860, 0.910, 0.820, 1 },
+        { 'Button',               0.150, 0.300, 0.120, 0.9 },
+        { 'ButtonHovered',        0.260, 0.470, 0.180, 1 },
+        { 'ButtonActive',         0.330, 0.570, 0.230, 1 },
+        { 'FrameBg',              0.100, 0.160, 0.080, 1 },
+        { 'FrameBgHovered',       0.150, 0.240, 0.120, 1 },
+        { 'FrameBgActive',        0.200, 0.310, 0.150, 1 },
+        { 'CheckMark',            0.920, 0.780, 0.280, 1 },
+        { 'Separator',            0.400, 0.520, 0.180, 0.5 },
+        { 'ChildBg',              0.040, 0.065, 0.040, 1 },
+        { 'ScrollbarBg',          0.060, 0.100, 0.050, 0.6 },
+        { 'ScrollbarGrab',        0.150, 0.300, 0.120, 0.9 },
+        { 'ScrollbarGrabHovered', 0.260, 0.470, 0.180, 1 },
+        { 'ScrollbarGrabActive',  0.330, 0.570, 0.230, 1 },
+        { 'Tab',                  0.090, 0.170, 0.080, 1 },
+        { 'TabHovered',           0.260, 0.470, 0.180, 1 },
+        { 'TabActive',            0.170, 0.310, 0.120, 1 },
+        { 'TabUnfocused',         0.070, 0.120, 0.060, 1 },
+        { 'TabUnfocusedActive',   0.130, 0.230, 0.100, 1 },
+        { 'Header',               0.140, 0.260, 0.110, 0.7 },
+        { 'HeaderHovered',        0.220, 0.400, 0.160, 0.9 },
+        { 'HeaderActive',         0.280, 0.490, 0.200, 1 },
+        { 'PopupBg',              0.050, 0.080, 0.045, 0.96 },
+    } },
+    -- The original purple/gold Unity look, text title, no art.
+    ['Classic'] = { colors = {
+        { 'WindowBg',             0.07, 0.055, 0.11, 1 },
+        { 'TitleBg',              0.10, 0.08, 0.16, 1 },
+        { 'TitleBgActive',        0.15, 0.11, 0.24, 1 },
+        { 'Border',               0.72, 0.57, 0.25, 0.85 },
+        { 'Text',                 0.86, 0.83, 0.93, 1 },
+        { 'Button',               0.24, 0.18, 0.40, 0.9 },
+        { 'ButtonHovered',        0.42, 0.31, 0.66, 1 },
+        { 'ButtonActive',         0.52, 0.40, 0.78, 1 },
+        { 'FrameBg',              0.13, 0.10, 0.21, 1 },
+        { 'FrameBgHovered',       0.21, 0.16, 0.34, 1 },
+        { 'FrameBgActive',        0.28, 0.21, 0.44, 1 },
+        { 'CheckMark',            0.85, 0.70, 0.32, 1 },
+        { 'Separator',            0.50, 0.40, 0.22, 0.5 },
+        { 'ChildBg',              0.05, 0.04, 0.09, 1 },
+        { 'ScrollbarBg',          0.08, 0.06, 0.13, 0.6 },
+        { 'ScrollbarGrab',        0.24, 0.18, 0.40, 0.9 },
+        { 'ScrollbarGrabHovered', 0.42, 0.31, 0.66, 1 },
+        { 'ScrollbarGrabActive',  0.52, 0.40, 0.78, 1 },
+    } },
+}
+-- Art-less twins: each color mood without the paintings (text title). The color tables are
+-- SHARED BY REFERENCE - a palette tweak fixes both siblings at once.
+THEMES['Classic Green'] = { colors = THEMES['Green Frog'].colors }
+THEMES['Classic Red']   = { colors = THEMES['RedFrog'].colors }
+THEMES['Classic Blue']  = { colors = THEMES['Blue Frog'].colors }
+local curTheme = 'Green Frog'
+
 local monitorMode  = false   -- second instance on this server+computer: alerts work, saveAll is gated
 local handshakeDone = false  -- writers only answer pings after their own handshake settles
 local writerSeen   = false
@@ -647,7 +827,8 @@ local function saveAll()
         }
     end
     mq.pickle(SAVE_FILE, { named = out, loot = lootWatch, replies = quickReplies, coin = coinTotal,
-        itemval = lootValTotal, tribute = tribTotal, croaks = croakLog, catseen = catalogSeen, schema = 61 })
+        itemval = lootValTotal, tribute = tribTotal, croaks = croakLog, catseen = catalogSeen,
+        theme = curTheme, schema = 61 })
 end
 
 local function loadAll()
@@ -688,6 +869,7 @@ local function loadAll()
     end
     lootWatch = saved.loot or {}
     catalogSeen = saved.catseen or {}
+    if saved.theme and THEMES[saved.theme] then curTheme = saved.theme end
     coinTotal = saved.coin or 0
     lootValTotal = saved.itemval or 0
     tribTotal    = saved.tribute or 0
@@ -829,6 +1011,47 @@ local TTS_PLUGIN = 'MQTextToSpeech'
 -- Common Windows voices. The plugin substring-matches (so "Zira" -> "Microsoft Zira") and doesn't
 -- expose the installed list to scripts, so this is a curated set; users with others use /tts voice.
 local TTS_VOICES = { "David", "Zira", "Mark" }
+
+-- Theme art (v1.28): PNGs under assets/img/, loaded once per art suffix via the PetGear
+-- pattern (mq.CreateTexture + Image). false = tried and missing -> the text header renders
+-- instead; no art file is ever a crash.
+local IMG_DIR = (((mq.luaDir or '') .. '/croakwatch/assets/images/'):gsub('\\', '/'))
+local artTex = {}
+
+-- Image loaders: getImg = any file in assets/img (theme-independent glyphs like icon_skull);
+-- getArt = themed pieces named <prefix>_<art>.png (banner_green, idle_green...).
+local function getImg(name)
+    if artTex[name] == nil then
+        local tex = mq.CreateTexture and mq.CreateTexture(IMG_DIR .. name .. '.png')
+        artTex[name] = (tex and tex.GetTextureID and tex:GetTextureID()) and tex or false
+    end
+    return artTex[name] or nil
+end
+
+local function getArt(prefix)
+    local art = THEMES[curTheme].art
+    if not art then return nil end
+    return getImg(prefix .. "_" .. art)
+end
+
+-- Theme art atlas: ONE 1024x1024 file per theme (atlas_<art>.png), pieces at FIXED slots -
+-- the layout contract shared with tools/cw_atlas.py. New themes are one file that either
+-- matches the template or doesn't. Unused canvas = reserved for future pieces.
+local ATLAS = {
+    banner   = { 0, 0, 1024, 256 },
+    idle     = { 0, 256, 512, 768 },
+    froghead = { 512, 256, 640, 384 },
+}
+
+local function pieceUV(name)
+    local r = ATLAS[name]
+    return r[1] / 1024, r[2] / 1024, r[3] / 1024, r[4] / 1024
+end
+
+-- icons.png: theme-independent 256x64 strip, 64px cells (0 = skull, 1 = frog)
+local function iconUV(cell)
+    return ImVec2(cell / 4, 0), ImVec2((cell + 1) / 4, 1)
+end
 
 -- /beep <file> plays a WAV async via Windows PlaySound (verified in MQ source). Quote for spaces.
 local function playWav(file)
@@ -1342,33 +1565,25 @@ local lootCountCache, lootCountAt = {}, 0   -- inv/bank counts per watched item,
 local grpObs = {}                    -- registered DanNet observers, keyed "peer|item"
 local grpCountCache = {}             -- per watched item: { have, total, who } - refreshed from the MAIN loop
 
--- Purple/gold theme (Unity palette). Pushed before Begin so it skins the chrome.
+-- Theme chrome: pushes the ACTIVE theme's color set (names resolved through ImGuiCol so an
+-- unknown/renamed enum entry skips instead of crashing) + the shared style vars.
 local function pushTheme()
-    imgui.PushStyleColor(ImGuiCol.WindowBg,        0.07, 0.055, 0.11, 1)
-    imgui.PushStyleColor(ImGuiCol.TitleBg,         0.10, 0.08, 0.16, 1)
-    imgui.PushStyleColor(ImGuiCol.TitleBgActive,   0.15, 0.11, 0.24, 1)
-    imgui.PushStyleColor(ImGuiCol.Border,          0.72, 0.57, 0.25, 0.85)
-    imgui.PushStyleColor(ImGuiCol.Text,            0.86, 0.83, 0.93, 1)
-    imgui.PushStyleColor(ImGuiCol.Button,          0.24, 0.18, 0.40, 0.9)
-    imgui.PushStyleColor(ImGuiCol.ButtonHovered,   0.42, 0.31, 0.66, 1)
-    imgui.PushStyleColor(ImGuiCol.ButtonActive,    0.52, 0.40, 0.78, 1)
-    imgui.PushStyleColor(ImGuiCol.FrameBg,         0.13, 0.10, 0.21, 1)
-    imgui.PushStyleColor(ImGuiCol.FrameBgHovered,  0.21, 0.16, 0.34, 1)
-    imgui.PushStyleColor(ImGuiCol.FrameBgActive,   0.28, 0.21, 0.44, 1)
-    imgui.PushStyleColor(ImGuiCol.CheckMark,       0.85, 0.70, 0.32, 1)
-    imgui.PushStyleColor(ImGuiCol.Separator,       0.50, 0.40, 0.22, 0.5)
-    imgui.PushStyleColor(ImGuiCol.ChildBg,         0.05, 0.04, 0.09, 1)
-    imgui.PushStyleColor(ImGuiCol.ScrollbarBg,         0.08, 0.06, 0.13, 0.6)
-    imgui.PushStyleColor(ImGuiCol.ScrollbarGrab,       0.24, 0.18, 0.40, 0.9)   -- = Button
-    imgui.PushStyleColor(ImGuiCol.ScrollbarGrabHovered, 0.42, 0.31, 0.66, 1)    -- = ButtonHovered
-    imgui.PushStyleColor(ImGuiCol.ScrollbarGrabActive,  0.52, 0.40, 0.78, 1)    -- = ButtonActive
+    local cols = THEMES[curTheme].colors or THEMES['Classic'].colors
+    local n = 0
+    for _, c in ipairs(cols) do
+        local idx = ImGuiCol[c[1]]
+        if idx then
+            imgui.PushStyleColor(idx, c[2], c[3], c[4], c[5])
+            n = n + 1
+        end
+    end
     imgui.PushStyleVar(ImGuiStyleVar.WindowRounding, 9)
     imgui.PushStyleVar(ImGuiStyleVar.ChildRounding,  6)
     imgui.PushStyleVar(ImGuiStyleVar.FrameRounding,  5)
     imgui.PushStyleVar(ImGuiStyleVar.GrabRounding,   4)
     imgui.PushStyleVar(ImGuiStyleVar.FrameBorderSize, 1)
     imgui.PushStyleVar(ImGuiStyleVar.ScrollbarRounding, 6)
-    return 18, 6
+    return n, 6
 end
 
 local function gold(text)
@@ -2474,6 +2689,19 @@ local function renderStatsTab()
 end
 
 local function renderOptionsTab()
+            gold("Theme")
+            imgui.SetNextItemWidth(220)
+            if imgui.BeginCombo("##cwtheme", curTheme) then
+                for _, name in ipairs(THEME_NAMES) do
+                    if imgui.Selectable(name, name == curTheme) then
+                        curTheme = name
+                        saveAll()
+                    end
+                end
+                imgui.EndCombo()
+            end
+            if imgui.IsItemHovered() then imgui.SetTooltip("restyles CroakWatch's artwork and colors - applies instantly.\nSemantic colors (green UP, yellow outsiders, teal hints) stay\nthe same in every theme so their meaning never changes.") end
+            imgui.Separator()
             gold("Sounds")
             soundOn = imgui.Checkbox("Sound (master - all CroakWatch sounds)", soundOn)
             -- Camp Watch box shows unchecked (and ignores clicks) while master is off, so master-off
@@ -2514,29 +2742,73 @@ local function renderMain()
         return
     end
 
-    imgui.PushFont(nil, imgui.GetFontSize() * 1.25)
-    gold("CROAKWATCH")
-    imgui.PopFont()
-    imgui.SameLine(); imgui.TextDisabled("v" .. VERSION)
-    imgui.SameLine(); if imgui.SmallButton(paused and "Resume" or "Pause") then paused = not paused end
-    if paused then imgui.SameLine(); imgui.TextColored(0.95, 0.40, 0.40, 1, "[PAUSED]") end
-    if monitorMode then
-        imgui.SameLine(); imgui.TextColored(0.45, 0.85, 0.85, 1, "[MONITOR]")
-        if imgui.IsItemHovered() then imgui.SetTooltip("Monitor-only protective mode - another CroakWatch on this\ncomputer owns this server's save file. Alerts, timers and the\nUI all work, but nothing this instance sees or edits is saved.") end
+    -- Header: full-width painted banner with the controls OVERLAID on the art's dark right side
+    -- (draw order layers them on top), or the classic text title when the theme has no art.
+    -- GOTCHA (found v1.29, lost the _/X buttons): SameLine(x) measures from the GROUP's start,
+    -- not the window's - right-aligning inside a group lands off-screen. Overlays use absolute
+    -- SetCursorScreenPos instead.
+    local banner = getArt('atlas')
+    if banner then
+        local bw = imgui.GetWindowWidth() - 16
+        local bh = math.floor(bw / 4)   -- banner slot is exactly 4:1 (1024x256 in the pow2 atlas)
+        local origin = imgui.GetCursorScreenPosVec()
+        local bu0, bv0, bu1, bv1 = pieceUV('banner')
+        imgui.Image(banner:GetTextureID(), ImVec2(bw, bh), ImVec2(bu0, bv0), ImVec2(bu1, bv1))
+        -- the frog itself is a minimize button (invisible hitbox over the art's left quarter)
+        imgui.SetCursorScreenPos(ImVec2(origin.x, origin.y))
+        if imgui.InvisibleButton("##frogmin", ImVec2(math.floor(bw * 0.25), bh)) then minimized = true end
+        if imgui.IsItemHovered() then imgui.SetTooltip("click the frog to minimize") end
+        -- right-aligned overlays share one computed right margin (never guess UI positions)
+        local pad2 = imgui.GetStyle().FramePadding.x * 2
+        local sp   = imgui.GetStyle().ItemSpacing.x
+        local xBlockW = (imgui.CalcTextSize("_") + pad2) + sp + (imgui.CalcTextSize("X") + pad2)
+        imgui.SetCursorScreenPos(ImVec2(origin.x + bw - 8 - xBlockW, origin.y + 6))
+        if imgui.SmallButton("_##min") then minimized = true end
+        imgui.SameLine()
+        if imgui.SmallButton("X##close") then running = false end
+        -- version + Pause sit low, under the wordmark's tail, right-aligned with the X above
+        local pLabel = paused and "Resume" or "Pause"
+        local vpW = imgui.CalcTextSize("v" .. VERSION) + sp + (imgui.CalcTextSize(pLabel) + pad2)
+        imgui.SetCursorScreenPos(ImVec2(origin.x + bw - 8 - vpW, origin.y + bh - 42))
+        imgui.TextDisabled("v" .. VERSION)
+        imgui.SameLine(); if imgui.SmallButton(pLabel) then paused = not paused end
+        if paused or monitorMode then
+            imgui.SetCursorScreenPos(ImVec2(origin.x + bw - 300, origin.y + bh - 42))
+            if paused then
+                imgui.TextColored(0.95, 0.40, 0.40, 1, "[PAUSED]")
+                if monitorMode then imgui.SameLine() end
+            end
+            if monitorMode then
+                imgui.TextColored(0.45, 0.85, 0.85, 1, "[MONITOR]")
+                if imgui.IsItemHovered() then imgui.SetTooltip("Monitor-only protective mode - another CroakWatch on this\ncomputer owns this server's save file. Alerts, timers and the\nUI all work, but nothing this instance sees or edits is saved.") end
+            end
+        end
+        imgui.SetCursorScreenPos(ImVec2(origin.x, origin.y + bh + 4))   -- resume normal flow below the art
+    else
+        imgui.PushFont(nil, imgui.GetFontSize() * 1.25)
+        gold("CROAKWATCH")
+        imgui.PopFont()
+        imgui.SameLine(); imgui.TextDisabled("v" .. VERSION)
+        imgui.SameLine(); if imgui.SmallButton(paused and "Resume" or "Pause") then paused = not paused end
+        if paused then imgui.SameLine(); imgui.TextColored(0.95, 0.40, 0.40, 1, "[PAUSED]") end
+        if monitorMode then
+            imgui.SameLine(); imgui.TextColored(0.45, 0.85, 0.85, 1, "[MONITOR]")
+            if imgui.IsItemHovered() then imgui.SetTooltip("Monitor-only protective mode - another CroakWatch on this\ncomputer owns this server's save file. Alerts, timers and the\nUI all work, but nothing this instance sees or edits is saved.") end
+        end
+        -- Custom window controls (no native title bar): minimize + close, top-right. X stops the
+        -- script; _ drops to the mini-icon.
+        local btnW = imgui.CalcTextSize("X") + imgui.GetStyle().FramePadding.x * 2   -- CalcTextSize returns x,y; first = width
+        imgui.SameLine(imgui.GetWindowWidth() - btnW * 2 - 14)
+        if imgui.SmallButton("_##min") then minimized = true end
+        imgui.SameLine()
+        if imgui.SmallButton("X##close") then running = false end
     end
-    -- Custom window controls (no native title bar now): minimize + close, top-right. X stops the
-    -- script (as the native X did); _ drops to the mini-icon. NoTitleBar removes native dragging -
-    -- by default ImGui still lets you drag empty body space, so the header area should still move it.
-    local btnW = imgui.CalcTextSize("X") + imgui.GetStyle().FramePadding.x * 2   -- CalcTextSize returns x,y; first = width
-    imgui.SameLine(imgui.GetWindowWidth() - btnW * 2 - 14)
-    if imgui.SmallButton("_##min") then minimized = true end
-    imgui.SameLine()
-    if imgui.SmallButton("X##close") then running = false end
     imgui.TextDisabled(string.format("%s  -  %s", mq.TLO.Zone.Name() or "?", myServer ~= "" and myServer or "?"))
     if curZoneShort:find("#hh", 1, true) then   -- zone badge lives with the zone line (proximity)
         imgui.SameLine(); imgui.TextColored(0.95, 0.65, 0.30, 1, "[HH]")
         if imgui.IsItemHovered() then imgui.SetTooltip("Hardcore Heritage zone - same zone, DIFFERENT mobs (level-scaled\nevent versions). CroakWatch keeps a separate book for the HH era:\nits own named, timers and loot, reopened intact each HH season.\nThe classic zone's data is untouched.") end
     end
+    imgui.SameLine(0, 18)   -- zone watch joins the zone line: one full-width info row
     zoneWatch = imgui.Checkbox("##zonewatch", zoneWatch)
     if imgui.IsItemHovered() then imgui.SetTooltip("Zone watch - alert when non-group players enter the zone") end
     imgui.SameLine()
@@ -2676,15 +2948,39 @@ local function renderMain()
             if selEntry then
                 renderDetail(selEntry)
             else
-                imgui.Spacing()
-                imgui.TextDisabled("  Select a camp on the left")
-                imgui.TextDisabled("  to see its details.")
+                -- idle art: cover-fill the whole panel (UV-crop the square asset to the panel's
+                -- aspect - edges crop instead of the image shrinking); the hint text overlays
+                -- the darkened band baked into the asset's top.
+                local idle = getArt('atlas')
+                if idle then
+                    local origin = imgui.GetCursorScreenPosVec()
+                    local avail  = imgui.GetContentRegionAvailVec()
+                    -- cover-crop FRACTIONS within the idle piece, then remap into its atlas slot
+                    local fu0, fv0, fu1, fv1 = 0, 0, 1, 1
+                    local a = avail.x / math.max(avail.y, 1)
+                    if a < 1 then fu0 = (1 - a) / 2; fu1 = 1 - fu0
+                    elseif a > 1 then fv0 = (1 - 1/a) / 2; fv1 = 1 - fv0 end
+                    local pu0, pv0, pu1, pv1 = pieceUV('idle')
+                    local pw, ph = pu1 - pu0, pv1 - pv0
+                    imgui.Image(idle:GetTextureID(), ImVec2(avail.x, avail.y),
+                        ImVec2(pu0 + fu0 * pw, pv0 + fv0 * ph), ImVec2(pu0 + fu1 * pw, pv0 + fv1 * ph))
+                    imgui.SetCursorScreenPos(ImVec2(origin.x + 8, origin.y + 6))
+                    imgui.TextDisabled("Select a camp on the left")
+                    imgui.SetCursorScreenPos(ImVec2(origin.x + 8, origin.y + 24))
+                    imgui.TextDisabled("to see its details.")
+                else
+                    imgui.Spacing()
+                    imgui.TextDisabled("  Select a camp on the left")
+                    imgui.TextDisabled("  to see its details.")
+                end
             end
             imgui.EndChild()
 
             -- Bottom row: Recent Croaks (named-kill feed) + Croak Stats (all-time, this server)
             local halfW = (imgui.GetContentRegionAvailVec().x - 6) * 0.5
             imgui.BeginChild("##croaks", halfW, 0, true)
+            local ic = getImg('icons')
+            if ic then imgui.Image(ic:GetTextureID(), ImVec2(14, 14), iconUV(0)); imgui.SameLine() end
             imgui.TextColored(0.56, 0.45, 0.84, 1, "RECENT CROAKS")
             imgui.SameLine()
             imgui.TextDisabled(string.format(" you %d  pets %d  grp %d", sessionCroaks.self, sessionCroaks.pet, sessionCroaks.grp))
@@ -2699,6 +2995,8 @@ local function renderMain()
             imgui.EndChild()
             imgui.SameLine()
             imgui.BeginChild("##croakstats", 0, 0, true)
+            local ic2 = getImg('icons')
+            if ic2 then imgui.Image(ic2:GetTextureID(), ImVec2(14, 14), iconUV(1)); imgui.SameLine() end
             imgui.TextColored(0.56, 0.45, 0.84, 1, "CROAK STATS")
             local tn, tp, mostName, mostN, rsum, rcnt = 0, 0, nil, 0, 0, 0
             for _, e in pairs(db) do
@@ -2831,6 +3129,13 @@ local function renderMini()
     if draw then
         local up = 0
         for _, e in ipairs(roster) do if e.isUp then up = up + 1 end end
+        local fh = getArt('atlas')
+        if fh then
+            local u0, v0, u1, v1 = pieceUV('froghead')
+            imgui.Image(fh:GetTextureID(), ImVec2(24, 24), ImVec2(u0, v0), ImVec2(u1, v1))
+            if imgui.IsItemClicked() then minimized = false end
+            imgui.SameLine(0, 4)
+        end
         if paused then imgui.PushStyleColor(ImGuiCol.Text, 0.95, 0.40, 0.40, 1)
         else imgui.PushStyleColor(ImGuiCol.Text, 0.90, 0.76, 0.36, 1) end
         if imgui.Button(paused and " CW  PAUSED " or string.format(monitorMode and " CW MON  %d up " or " CW  %d up ", up)) then minimized = false end

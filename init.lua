@@ -481,6 +481,9 @@
 --        only; the ART carries the red) + three art-less CLASSIC color twins (Classic Green/
 --        Red/Blue - color tables shared BY REFERENCE with their art siblings, so a palette
 --        tweak fixes both). Seven themes total.
+-- v1.40: PC LEAVE alert (RG user request) - Zone Watch now also notes departures: "X left the
+--        zone" as a quiet info echo + Camp Watch feed line, NO sound (departure = relief, not
+--        alarm; the intruder WAV stays arrivals-only). Same diff as arrivals, read backwards.
 
 local mq     = require('mq')
 local imgui  = require('ImGui')
@@ -493,7 +496,7 @@ if not okCatalog or type(catalog) ~= 'table' or type(catalog.zones) ~= 'table' t
     catalog = { version = 0, zones = {} }
 end
 
-local VERSION   = '1.39'
+local VERSION   = '1.40'
 local launchArg = ...
 local myServer  = mq.TLO.EverQuest.Server() or ""
 
@@ -1534,6 +1537,18 @@ local function pollZonePcs()
                     p.guild ~= "" and (" <" .. p.guild .. ">") or "")
                 if watchEcho then warn(desc) end
                 playWav(INTRUDER_WAV)
+                watchPush("zone", desc)
+            end
+        end
+        -- departures (RG request, v1.40): previous list vs current map. Deliberately QUIET -
+        -- info echo + feed line, NO sound (a departure is relief, not alarm; a chime here would
+        -- train users to ignore the intruder sound). Note: "left" = gone from the spawn list -
+        -- zoned, camped or died, we cannot tell which.
+        for _, p in ipairs(zonePcsList) do
+            if not now[p.name] then
+                local desc = string.format("%s (%d %s)%s left the zone", p.name, p.level, p.class,
+                    p.guild ~= "" and (" <" .. p.guild .. ">") or "")
+                if watchEcho then info(desc) end
                 watchPush("zone", desc)
             end
         end
@@ -2810,7 +2825,7 @@ local function renderMain()
     end
     imgui.SameLine(0, 18)   -- zone watch joins the zone line: one full-width info row
     zoneWatch = imgui.Checkbox("##zonewatch", zoneWatch)
-    if imgui.IsItemHovered() then imgui.SetTooltip("Zone watch - alert when non-group players enter the zone") end
+    if imgui.IsItemHovered() then imgui.SetTooltip("Zone watch - alert when non-group players enter the zone\n(sound + warning) or leave it (quiet note - they zoned,\ncamped or died; the spawn list can't tell which)") end
     imgui.SameLine()
     if zoneWatch then
         local n = #zonePcsList

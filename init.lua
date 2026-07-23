@@ -484,6 +484,23 @@
 -- v1.40: PC LEAVE alert (RG user request) - Zone Watch now also notes departures: "X left the
 --        zone" as a quiet info echo + Camp Watch feed line, NO sound (departure = relief, not
 --        alarm; the intruder WAV stays arrivals-only). Same diff as arrivals, read backwards.
+-- v1.41: EXACT ITEM MATCHING (RG user report + snippet). MQ's FindItem family matches
+--        SUBSTRINGS, so "Silk Cloth" also found "Silk Cloth Sash" - wrong tooltip data and
+--        inflated inv/bank/group counts. New itemQuery() resolves the '=' exact form when the
+--        name exists exactly, else falls back to substring so DELIBERATE PARTIAL watch entries
+--        ("glowing seb") keep working; a user-typed leading '=' forces exact end to end
+--        (including the loot-line match). Tooltip lookup + its Qty line (exact on the RESOLVED
+--        name), Loot Watch self counts, and the DanNet observer queries all use it - peers now
+--        count the same string we do. Observer drops try both forms so none leak.
+-- v1.42: QUOTES = EXACT (AL's design, replacing v1.41's conditional rule - "exact when it
+--        happens to resolve" was unpredictable: the same typed entry behaved differently
+--        depending on your bags). Now the USER decides and the rule holds EVERYWHERE (loot-line
+--        trigger, inv/bank counts, group counts, tooltip): "silk cloth" quoted (or MQ's '='
+--        prefix) = that exact item only; unquoted = partial as always. Drop-log/tally tooltips
+--        pass exactName since those names come from real loot lines. Teach tooltip on the Loot
+--        Watch input + a Help tab tip. NOTE: shared bank is NOT counted - MQ's FindItem family
+--        covers inventory (+keyrings) and bank only (docs-verified); Me.SharedBank[n] exists but
+--        has no count TLO, so shared-bank support would mean walking slots manually (future).
 
 local mq     = require('mq')
 local imgui  = require('ImGui')
@@ -496,7 +513,7 @@ if not okCatalog or type(catalog) ~= 'table' or type(catalog.zones) ~= 'table' t
     catalog = { version = 0, zones = {} }
 end
 
-local VERSION   = '1.40'
+local VERSION   = '1.42'
 local launchArg = ...
 local myServer  = mq.TLO.EverQuest.Server() or ""
 
@@ -1205,6 +1222,27 @@ local function onKill(mobName, killer)
     end
 end
 
+-- Item lookups are SUBSTRING by default in MQ ("silk cloth" also finds "Silk Cloth Sandals"),
+-- which showed the wrong item's tooltip and inflated counts (RG user report). The user decides
+-- per entry, and the rule is the same EVERYWHERE (v1.42 - v1.41's "exact when it happens to
+-- resolve" was unpredictable): QUOTED "silk cloth" (or MQ's own '=' prefix) = exact item only;
+-- unquoted = partial, as before. mq's exact form is the '=' prefix, so quotes translate to it.
+local function isExactEntry(name)
+    return name:sub(1, 1) == '=' or (name:sub(1, 1) == '"' and name:sub(-1) == '"' and #name > 2)
+end
+
+-- the bare item name an entry means, with the exactness marker stripped
+local function watchBare(name)
+    if name:sub(1, 1) == '=' then return name:sub(2) end
+    if name:sub(1, 1) == '"' and name:sub(-1) == '"' and #name > 2 then return name:sub(2, -2) end
+    return name
+end
+
+-- the string to hand MQ's FindItem family for this entry
+local function itemQuery(name)
+    return (isExactEntry(name) and '=' or '') .. watchBare(name)
+end
+
 local function onLoot(item, looter, corpse)
     if paused then return end
     dropLog[#dropLog + 1] = { t = os.date("%H:%M"), item = item, who = looter or "?" }
@@ -1222,7 +1260,11 @@ local function onLoot(item, looter, corpse)
     -- Global Loot Watch: targeted radar for items anywhere, anyone. Case-insensitive substring so a
     -- manual "glowing seb" matches "Glowing Sebilite Scale Boots" (was case-sensitive - never matched).
     for _, w in ipairs(lootWatch) do
-        if item:lower():find(w.item:lower(), 1, true) then
+        local bare = watchBare(w.item):lower()
+        local hit
+        if isExactEntry(w.item) then hit = item:lower() == bare
+        else hit = item:lower():find(bare, 1, true) ~= nil end
+        if hit then
             w.count = w.count + 1
             info(string.format("\ag[DROP]\at %s (looted by %s, total %d)", w.item, looter or "?", w.count))
             if soundOn then mq.cmd('/popup ' .. w.item .. ' dropped') end
@@ -1646,10 +1688,13 @@ local animItems = mq.FindTextureAnimation("A_DragItem")
 local EQ_ICON_OFFSET = 500
 local ITEM_SIZES = { [0] = "Tiny", [1] = "Small", [2] = "Medium", [3] = "Large", [4] = "Giant" }
 
-local function itemTooltip(name)
+-- `exactName` = the caller knows this is a real full item name (a drop line, a loot tally key),
+-- so look it up exactly regardless of quoting. Watch-list rows pass their entry as typed.
+local function itemTooltip(name, exactName)
     if not imgui.IsItemHovered() then return end
-    local it = mq.TLO.FindItem(name)
-    if it() == nil then it = mq.TLO.FindItemBank(name) end
+    local q = exactName and ('=' .. name) or itemQuery(name)
+    local it = mq.TLO.FindItem(q)
+    if it() == nil then it = mq.TLO.FindItemBank(q) end
     -- Ctrl+Right-Click the hovered name -> open the REAL EQ item display via the item link
     -- (BigBag pattern: ItemLink('CLICKABLE') + /executelink). The full sheet, drawn by the game.
     if it() ~= nil and imgui.IsKeyDown(ImGuiMod.Ctrl) and imgui.IsItemClicked(ImGuiMouseButton.Right) then
@@ -1689,7 +1734,8 @@ local function itemTooltip(name)
         if wt > 0 then p[#p + 1] = string.format("Wt %.1f", wt / 10) end
         local maxStack = it.StackSize() or 0
         if maxStack > 1 then
-            local owned = (mq.TLO.FindItemCount(it.Name())() or 0) + (mq.TLO.FindItemBankCount(it.Name())() or 0)
+            local exact = '=' .. (it.Name() or name)   -- resolved full name: count this item only
+            local owned = (mq.TLO.FindItemCount(exact)() or 0) + (mq.TLO.FindItemBankCount(exact)() or 0)
             p[#p + 1] = string.format("Qty %d / %d", owned, maxStack)
         end
         local val = it.Value() or 0
@@ -2043,7 +2089,7 @@ local function renderDetail(e)
         imgui.PushID(row.it)
         if imgui.SmallButton("X") then removeIt = row.it end
         imgui.SameLine(); imgui.TextDisabled(row.it)
-        itemTooltip(row.it)
+        itemTooltip(row.it, true)
         imgui.SameLine(); imgui.TextColored(0.3, 1.0, 0.3, 1, "x" .. row.cnt)
         imgui.PopID()
     end
@@ -2269,8 +2315,13 @@ local function dropGroupObservers(item)
     for key in pairs(grpObs) do
         local peer, it = key:match("^(.-)|(.+)$")
         if it == item then
-            mq.cmdf('/squelch /dobserve %s -q "FindItemCount[%s]" -drop', peer, item)
-            mq.cmdf('/squelch /dobserve %s -q "FindItemBankCount[%s]" -drop', peer, item)
+            -- drop BOTH query forms: an observer may have been registered under the exact ('=name')
+            -- or the plain form depending on what resolved at registration time
+            local bare = watchBare(item)
+            for _, q in ipairs({ item, '=' .. bare, bare }) do
+                mq.cmdf('/squelch /dobserve %s -q "FindItemCount[%s]" -drop', peer, q)
+                mq.cmdf('/squelch /dobserve %s -q "FindItemBankCount[%s]" -drop', peer, q)
+            end
             grpObs[key] = nil
         end
     end
@@ -2282,10 +2333,11 @@ local function refreshGroupCounts()
     local nMembers = mq.TLO.Group.Members() or 0
     if nMembers == 0 or #lootWatch == 0 then return end
     for _, w in ipairs(lootWatch) do
-        local qi = string.format("FindItemCount[%s]", w.item)
-        local qb = string.format("FindItemBankCount[%s]", w.item)   -- bank too (iTrack parity)
-        local selfInv  = mq.TLO.FindItemCount(w.item)() or 0
-        local selfBank = mq.TLO.FindItemBankCount(w.item)() or 0
+        local q  = itemQuery(w.item)   -- same string for us and the peers: everyone counts alike
+        local qi = string.format("FindItemCount[%s]", q)
+        local qb = string.format("FindItemBankCount[%s]", q)   -- bank too (iTrack parity)
+        local selfInv  = mq.TLO.FindItemCount(q)() or 0
+        local selfBank = mq.TLO.FindItemBankCount(q)() or 0
         local have, total = (selfInv + selfBank) > 0 and 1 or 0, 1
         local who = { { name = mq.TLO.Me.CleanName() or "me", inv = selfInv, bank = selfBank } }
         for i = 1, nMembers do
@@ -2325,9 +2377,10 @@ local function renderLootWatch()
     if mq.gettime() - lootCountAt > 5000 then
         lootCountAt, lootCountCache = mq.gettime(), {}
         for _, w in ipairs(lootWatch) do
+            local q = itemQuery(w.item)   -- exact when it resolves; partial watches still work
             lootCountCache[w.item] = {
-                inv  = mq.TLO.FindItemCount(w.item)() or 0,
-                bank = mq.TLO.FindItemBankCount(w.item)() or 0,
+                inv  = mq.TLO.FindItemCount(q)() or 0,
+                bank = mq.TLO.FindItemBankCount(q)() or 0,
             }
         end
     end
@@ -2388,7 +2441,7 @@ local function renderLootWatch()
             lootInput = mq.TLO.Cursor.Name() or lootInput
             mq.cmd("/autoinventory")
         else
-            imgui.SetTooltip("type a partial name (case doesn't matter),\nor hover here with an item on your cursor")
+            imgui.SetTooltip("type a partial name (case doesn't matter): silk cloth also\nwatches Silk Cloth Sandals. For ONE exact item, use quotes:\n\"Silk Cloth\" - counts and tooltips then ignore look-alikes.\nOr hover here with an item on your cursor.")
         end
     end
     imgui.SameLine()
@@ -2632,7 +2685,7 @@ local function renderStatsTab()
                     end
                     imgui.TextDisabled(d.t); imgui.SameLine()
                     imgui.TextColored(0.79, 0.63, 0.91, 1, it)
-                    itemTooltip(d.item)   -- full card carries the full name, so truncation costs nothing
+                    itemTooltip(d.item, true)   -- full card carries the full name, so truncation costs nothing
                     imgui.SameLine(); imgui.TextColored(0.45, 0.80, 0.80, 1, "- " .. d.who)
                 end
                 imgui.EndChild()
@@ -3045,7 +3098,7 @@ local function renderMain()
             for i = #dropLog, math.max(1, #dropLog - 7), -1 do
                 imgui.TextDisabled(dropLog[i].t); imgui.SameLine()
                 imgui.TextColored(0.79, 0.63, 0.91, 1, dropLog[i].item)
-                itemTooltip(dropLog[i].item)
+                itemTooltip(dropLog[i].item, true)
                 imgui.SameLine(); imgui.TextColored(0.45, 0.80, 0.80, 1, "- " .. dropLog[i].who)
             end
 
@@ -3067,7 +3120,7 @@ local function renderMain()
             for i = 1, math.min(#tops, 8) do
                 imgui.TextColored(0.3, 1.0, 0.3, 1, "x" .. tops[i].cnt); imgui.SameLine()
                 imgui.TextColored(0.79, 0.63, 0.91, 1, tops[i].it)
-                itemTooltip(tops[i].it)
+                itemTooltip(tops[i].it, true)
                 imgui.SameLine()
                 imgui.TextColored(0.90, 0.76, 0.36, 1, "(" .. tops[i].src .. ")")
             end
@@ -3118,6 +3171,7 @@ local function renderMain()
             imgui.BulletText("Second toon on the same server? Just start CW - it auto-protects your data")
             imgui.BulletText("No achievement (EMU)? Use the Catalog button in Camps to import named")
             imgui.BulletText("Hidden mobs still track silently - the Hidden checkbox reveals them")
+            imgui.BulletText("Loot Watch: plain text matches partially; \"quote it\" for one exact item")
             imgui.BulletText("HH / event zones keep their own book - the [HH] badge shows which is open")
             imgui.Separator()
             gold("Version")

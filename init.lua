@@ -501,6 +501,41 @@
 --        Watch input + a Help tab tip. NOTE: shared bank is NOT counted - MQ's FindItem family
 --        covers inventory (+keyrings) and bank only (docs-verified); Me.SharedBank[n] exists but
 --        has no count TLO, so shared-bank support would mean walking slots manually (future).
+-- v1.43: PH DISCOVERY FIX (the Chirid report: a named's PH list grew to nearly every mob in the
+--        area over one session; tightening spot radius 30->15 changed NOTHING, which ruled out
+--        radius tuning as the answer). Two root causes, both radius-independent:
+--        (a) the occupant was tracked by NAME, so a parade of same-named look-alikes read as
+--            repeated arrivals - now tracked by SPAWN ID (name kept for display);
+--        (b) any mob merely PRESENT became a candidate - now the same ID must hold the spot for
+--            PH_DWELL (60s) before it counts: a placeholder waits to be killed, a pather is gone
+--            in seconds. The dwell gate also protects the repop clock (interval is pending until
+--            the arrival settles) and the PH-kill tally (only a settled mob's departure counts).
+--        Plus a Z check in Lua (MQ's radius is horizontal only; zradius' centering is
+--        undocumented and we already hold both Z values) so other floors stop counting.
+--        AL verified the loc/radius spawn search itself IS correct via /echo tests - that
+--        hypothesis was eliminated before this fix was designed.
+-- v1.44: zone-line markers (AL) - MQ chat has no italics (color codes only), so arrivals get a
+--        ">> " prefix and departures a "<< ": direction scans instantly without reading the verb,
+--        on top of the existing yellow-warn / green-info split. ASCII only (the font renders
+--        real arrows as '?'). Feed lines stay unprefixed - the Camp Watch panel colors them.
+-- v1.45: LOC VERIFICATION (AL's "verified by CW spawn capture" idea, and the deeper half of the
+--        PH-flood fix). Each banked loc now counts SIGHTINGS: bankLoc increments a spot's count
+--        when the named spawns near it again instead of silently ignoring the repeat. A spot with
+--        2+ sightings is VERIFIED (a real spawn point); a single sighting stays unverified - it
+--        may be a roamer's patrol snapshot, or the mob simply entering client spawn range while
+--        wandering, which also reads as a fresh spawn (the remaining hole after v0.66). ONLY
+--        VERIFIED SPOTS ARE WATCHED for placeholders / the spot clock, so junk locs can no longer
+--        breed junk PHs (AL's own Plaguebringer: 6 locs spanning ~900 units -> 5 bogus PHs, 82
+--        phantom PH kills). Costs one warm-up cycle per spot after updating. Taught in the UI:
+--        the list row's hover explains @xN + verified/unverified, and the sidebar Location list
+--        labels each spot with its own tooltip.
+-- v1.46: verification meets SHARING. Export now ships VERIFIED spots only (coordinates alone -
+--        an unverified loc is a guess, and bad spots would breed bad PHs on every importer's
+--        client). Imported spots land at ZERO sightings, marked `shared` (AL's catch: `n` must
+--        count only YOUR OWN observed spawns, or one personal sighting + one stranger's claim
+--        would fake a verified spot). So a share file is a map, not evidence: it tells you where
+--        to camp, and your own two sightings still earn the watch. Sidebar labels the three
+--        states (verified xN / shared / unverified), each tooltip-taught.
 
 local mq     = require('mq')
 local imgui  = require('ImGui')
@@ -513,7 +548,7 @@ if not okCatalog or type(catalog) ~= 'table' or type(catalog.zones) ~= 'table' t
     catalog = { version = 0, zones = {} }
 end
 
-local VERSION   = '1.42'
+local VERSION   = '1.46'
 local launchArg = ...
 local myServer  = mq.TLO.EverQuest.Server() or ""
 
@@ -541,6 +576,8 @@ local SPOT_RADIUS_DEFAULT = 30   -- units around a named's captured loc counted 
 local KILL_RANGE       = 200     -- credit a kill only if the mob was last seen within this range (starting value - tune in field)
 local SPOT_TRUST_RANGE = 600     -- beyond this an EMPTY spot read means nothing (mob may just be out of client spawn range)
 local PH_THRESHOLD        = 2    -- distinct spawns on the spot before a mob is learned as a PH
+local PH_DWELL            = 60   -- seconds the SAME mob (by spawn ID) must hold the spot to count as
+                                 -- a placeholder rather than a passer-by (v1.43, the Chirid fix)
 
 -- Achievement objective name -> in-game spawn name corrections
 local nameMap = {
@@ -750,6 +787,12 @@ local function newEntry(name, achName, zone, manual)
     }
 end
 
+-- A banked spot is VERIFIED once the named has been seen SPAWNING there 2+ times (v1.45).
+-- `n` counts the user's OWN sightings only - imported spots start at 0 (see the v1.46 note).
+local function locVerified(L)
+    return (L.n or 1) >= 2
+end
+
 local function splitCSV(s)
     local t = {}
     for part in (s or ""):gmatch("[^,]+") do
@@ -918,7 +961,14 @@ local function exportShare()
         local z = zones[e.zone]
         if not z then z = { named = {} }; zones[e.zone] = z; nZones = nZones + 1 end
         local rec = { name = e.name }
-        if #e.locs > 0 then rec.locs = e.locs end
+        -- share VERIFIED spots only (v1.46): an unverified loc is a guess - a roamer's patrol
+        -- snapshot or a range-entry artefact - and bad spots would breed bad PHs on every
+        -- importer's client. Coordinates only; sighting counts are personal, never shipped.
+        local vlocs = {}
+        for _, L in ipairs(e.locs) do
+            if locVerified(L) then vlocs[#vlocs + 1] = { y = L.y, x = L.x, z = L.z } end
+        end
+        if #vlocs > 0 then rec.locs = vlocs end
         if #e.ph > 0 then rec.ph = e.ph end
         local best = (e.override and e.override > 0) and e.override or observedAvg(e.intervals)
         if best then rec.respawn = best end
@@ -1374,19 +1424,28 @@ end)
 -- Bank a named's SPAWN spot into e.locs (multi-loc: a named with a cluster of fixed spawn points).
 -- Called ONLY on a down->up transition (v0.66) - banking every frame while up logged a ROAMER's whole
 -- patrol as fake "spots" (Blightfire @x6). Dedups within spotRadius, caps at 6. Guards a junk 0,0,0 read.
+-- v1.45: each loc carries a SIGHTING COUNT. A spot the named has actually spawned at more than
+-- once is a VERIFIED spawn point; a one-off is a guess (a roamer's patrol snapshot, or the mob
+-- simply entering client range while wandering - which also reads as a fresh spawn). Only
+-- verified spots are watched for placeholders, so junk locs can never breed junk PHs.
 local function bankLoc(e, sp)
     if e.roams then return end   -- roamers wander out of client spawn range -> false respawns bank junk spots; don't
     local y, x, z = sp.Y(), sp.X(), sp.Z()
     if not y or not x or (y == 0 and x == 0 and (z or 0) == 0) then return end
     local r = e.spotRadius or SPOT_RADIUS_DEFAULT
     for _, L in ipairs(e.locs) do
-        if (L.y - y) ^ 2 + (L.x - x) ^ 2 <= r * r then return end   -- already near a known spot
+        if (L.y - y) ^ 2 + (L.x - x) ^ 2 <= r * r then   -- spawned at a spot we already know
+            L.n = (L.n or 1) + 1                         -- another confirmed sighting here
+            saveAll()
+            return
+        end
     end
     if #e.locs < 6 then
-        e.locs[#e.locs + 1] = { y = y, x = x, z = z }
+        e.locs[#e.locs + 1] = { y = y, x = x, z = z, n = 1 }   -- unverified until it repeats
         saveAll()
     end
 end
+
 
 local function pollByName(e)
     local sp    = mq.TLO.Spawn(string.format('npc "%s"', e.name))
@@ -1465,63 +1524,95 @@ local function pollSpot(e)
     if namedUp then return end                -- named is here; PH/spot tracking runs only while it's down
 
     -- PH discovery + best-effort spot-cycle clock. Nearest non-named occupant across banked spots.
-    local occ
-    for _, L in ipairs(e.locs) do
+    -- v1.43: the occupant is identified by SPAWN ID, not name - two look-alikes ("a moss viper"
+    -- x2) are different mobs, and name-only tracking let a parade of pathers read as one settled
+    -- occupant. Z is checked HERE in Lua (MQ's radius is horizontal only; zradius' centering is
+    -- undocumented, and we already hold both Z values - our own subtraction is unambiguous).
+    -- Only VERIFIED spots (the named has spawned there 2+ times) are watched. An unverified loc
+    -- is a guess - watching it is how a roamer's patrol snapshots learned the whole zone's trash.
+    local watched = {}
+    for _, L in ipairs(e.locs) do if locVerified(L) then watched[#watched + 1] = L end end
+    if #watched == 0 then return end
+
+    local occ, occId
+    for _, L in ipairs(watched) do
         local s2 = mq.TLO.NearestSpawn(string.format('npc loc %d %d %d radius %d', L.x, L.y, L.z, r))
         local n2 = s2() ~= nil and s2.CleanName() or nil
-        if n2 then
+        if n2 and math.abs((s2.Z() or 0) - (L.z or 0)) <= r then   -- same floor, not the column above/below
             local named = false
             for _, e2 in ipairs(roster) do if e2.name == n2 then named = true break end end
-            if not named then occ = n2; break end
+            if not named then occ, occId = n2, s2.ID(); break end
         end
     end
 
-    local prev = e.spotOccupant
-    if occ == prev then return end            -- no transition: do nothing, DON'T save (kills the churn)
+    local prevId = e.spotOccupantId
+    if occId == prevId then                   -- same MOB still sitting there: track its dwell time
+        if occId and e.spotSince and not e.spotDwelt and os.time() - e.spotSince >= PH_DWELL then
+            e.spotDwelt = true                -- settled: a placeholder waits to be killed, a pather doesn't
+            local settled, dchanged = e.spotOccupant, false
+            -- the repop interval measured when this mob arrived only counts now that it settled
+            if e.spotPendingIv and e.spotPendingIv >= 60 and e.spotPendingIv <= 2400 then
+                e.spotIntervals[#e.spotIntervals + 1] = e.spotPendingIv
+                if #e.spotIntervals > 10 then table.remove(e.spotIntervals, 1) end
+                dchanged = true
+            end
+            e.spotPendingIv = nil
+            local known = false
+            for _, ph in ipairs(e.ph) do if ph == settled then known = true break end end
+            if settled and not known then
+                e.phCandidates[settled] = (e.phCandidates[settled] or 0) + 1   -- transient: not saved until it learns
+                if e.phCandidates[settled] >= PH_THRESHOLD then
+                    e.ph[#e.ph + 1] = settled
+                    e.phCandidates[settled] = nil
+                    dchanged = true
+                    if not e.hidden then
+                        info(string.format("\ag[PH discovered]\at %s is a placeholder for \ap%s", settled, e.name))
+                    end
+                end
+            end
+            if dchanged then saveAll() end
+        end
+        return                                -- no transition: DON'T save (kills the churn)
+    end
 
     -- How close are we to the nearest banked spot? An EMPTY read from far away means nothing -
     -- the mob may simply be outside the client's spawn range, not dead.
     local meX, meY = mq.TLO.Me.X() or 0, mq.TLO.Me.Y() or 0
     local nearD2 = math.huge
-    for _, L in ipairs(e.locs) do
+    for _, L in ipairs(watched) do
         local d2 = (L.x - meX) ^ 2 + (L.y - meY) ^ 2
         if d2 < nearD2 then nearD2 = d2 end
     end
     if occ == nil and nearD2 > SPOT_TRUST_RANGE * SPOT_TRUST_RANGE then return end   -- unreliable read: no transition
 
+    -- The occupant CHANGED. Everything below is gated on whether the mob that just left had
+    -- DWELT at the spot (PH_DWELL seconds): a placeholder spawns and waits to be killed, a
+    -- pather is gone in seconds. Without this, dense zones adopt every passer-by as a PH and
+    -- pollute the repop clock + kill tally with them (the Chirid report, v1.43).
+    local leftDwelt = e.spotDwelt
     local changed = false
     if occ ~= nil then
-        if prev == nil and e.spotEmptyTime then   -- empty->occupied = a measured PH repop
-            local iv = os.time() - e.spotEmptyTime
-            if iv >= 60 and iv <= 2400 then
-                e.spotIntervals[#e.spotIntervals + 1] = iv
-                if #e.spotIntervals > 10 then table.remove(e.spotIntervals, 1) end
-                changed = true
-            end
+        -- empty->occupied = a candidate repop; only trust the interval once THIS mob settles
+        if prevId == nil and e.spotEmptyTime then
+            e.spotPendingIv = os.time() - e.spotEmptyTime
+        else
+            e.spotPendingIv = nil
         end
         e.spotEmptyTime = nil
-        local known = false
-        for _, ph in ipairs(e.ph) do if ph == occ then known = true break end end
-        if not known then
-            e.phCandidates[occ] = (e.phCandidates[occ] or 0) + 1   -- transient: not saved until it learns
-            if e.phCandidates[occ] >= PH_THRESHOLD then
-                e.ph[#e.ph + 1] = occ
-                e.phCandidates[occ] = nil
+    else                                      -- spot cleared (trusted read - we're within range)
+        -- only a mob that had SETTLED counts as a placeholder kill / a real cycle start
+        if leftDwelt then
+            e.spotEmptyTime = os.time()
+            if nearD2 <= KILL_RANGE * KILL_RANGE then   -- only OUR camp's clears count as PH kills
+                e.phKills = e.phKills + 1     -- count only; a PH kill must NOT touch the named's clock (v0.61)
                 changed = true
-                if not e.hidden then
-                    info(string.format("\ag[PH discovered]\at %s is a placeholder for \ap%s", occ, e.name))
-                end
             end
         end
-    else                                      -- occ == nil: spot cleared (trusted read - we're within range)
-        e.spotEmptyTime = os.time()
-        if nearD2 <= KILL_RANGE * KILL_RANGE then   -- only OUR camp's clears count as PH kills
-            e.phKills = e.phKills + 1         -- count only; a PH kill must NOT touch the named's clock (v0.61)
-            changed = true
-        end
+        e.spotPendingIv = nil
     end
 
-    e.spotOccupant = occ
+    e.spotOccupant, e.spotOccupantId = occ, occId
+    e.spotSince, e.spotDwelt = occ and os.time() or nil, false
     if changed then saveAll() end
 end
 
@@ -1577,8 +1668,8 @@ local function pollZonePcs()
             if not zonePcs[p.name] then
                 local desc = string.format("%s (%d %s)%s entered the zone", p.name, p.level, p.class,
                     p.guild ~= "" and (" <" .. p.guild .. ">") or "")
-                if watchEcho then warn(desc) end
-                playWav(INTRUDER_WAV)
+                if watchEcho then warn(">> " .. desc) end   -- ASCII markers: chat has no italics, and
+                playWav(INTRUDER_WAV)                       -- >> / << scan far faster than reading the verb
                 watchPush("zone", desc)
             end
         end
@@ -1590,7 +1681,7 @@ local function pollZonePcs()
             if not now[p.name] then
                 local desc = string.format("%s (%d %s)%s left the zone", p.name, p.level, p.class,
                     p.guild ~= "" and (" <" .. p.guild .. ">") or "")
-                if watchEcho then info(desc) end
+                if watchEcho then info("<< " .. desc) end
                 watchPush("zone", desc)
             end
         end
@@ -1859,6 +1950,29 @@ local function renderLeanRow(e)
     if imgui.Selectable("##row" .. e.name, sel) then
         selectedName = sel and nil or e.name
     end
+    if imgui.IsItemHovered() then   -- teach the row's shorthand, especially the @xN spot badge
+        local nv = 0
+        for _, L in ipairs(e.locs) do if locVerified(L) then nv = nv + 1 end end
+        imgui.BeginTooltip()
+        imgui.Text(e.name)
+        imgui.TextDisabled("click to open its details")
+        if #e.locs > 0 then
+            imgui.Separator()
+            imgui.TextColored(0.90, 0.76, 0.36, 1, string.format("@x%d = spawn spots CroakWatch has banked", #e.locs))
+            imgui.TextDisabled("A spot is banked when the named is seen SPAWNING there")
+            imgui.TextDisabled("(not merely standing there when you arrive).")
+            if nv > 0 then
+                imgui.TextColored(0.45, 0.85, 0.45, 1, string.format("%d verified - seen spawning there more than once;", nv))
+                imgui.TextDisabled("only these are watched for placeholders.")
+            end
+            if nv < #e.locs then
+                imgui.TextColored(0.95, 0.85, 0.35, 1, string.format("%d unverified - one sighting so far.", #e.locs - nv))
+                imgui.TextDisabled("A wandering named banks spots it merely walked past,")
+                imgui.TextDisabled("so those stay unwatched until they repeat.")
+            end
+        end
+        imgui.EndTooltip()
+    end
     local _, h = imgui.CalcTextSize("A")
     local dl   = imgui.GetWindowDrawList()
     local cy   = p.y + h * 0.5
@@ -2035,6 +2149,17 @@ local function renderDetail(e)
             end
             imgui.SameLine()
             imgui.TextDisabled(string.format("%d)  %.0f, %.0f", i, L.y, L.x))   -- shown in EQ /loc order: Y, X
+            imgui.SameLine()
+            if locVerified(L) then
+                imgui.TextColored(0.45, 0.85, 0.45, 1, string.format("verified x%d", L.n or 2))
+                if imgui.IsItemHovered() then imgui.SetTooltip("CroakWatch has seen this named SPAWN here more than once,\nso it is a real spawn point - watched for placeholders and\nfeeding the spot timer.") end
+            elseif L.shared then
+                imgui.TextColored(0.55, 0.75, 0.95, 1, "shared")
+                if imgui.IsItemHovered() then imgui.SetTooltip("a spot from an imported share file - good for navigating to,\nbut NOT counted as your own evidence: only spawns YOU see\ncount toward verifying a spot, so it stays unwatched until\nyou have watched this named spawn here twice yourself.") end
+            else
+                imgui.TextColored(0.95, 0.85, 0.35, 1, "unverified")
+                if imgui.IsItemHovered() then imgui.SetTooltip("seen spawning here once. That may be a real spot CroakWatch\nhas only caught once - or somewhere a WANDERING named walked\nthrough (or stood when it entered your spawn range).\nNot watched for placeholders until it repeats.") end
+            end
             imgui.PopID()
         end
     end
@@ -2286,7 +2411,18 @@ local function renderImportPopup()
                         local e = newEntry(nm, nm, curZoneShort, true)
                         if type(c) == "table" then
                             if c.respawn then e.respawnHint = c.respawn end
-                            if type(c.locs) == "table" and #c.locs > 0 then e.locs = c.locs end
+                            -- imported spots land at ZERO sightings (AL's catch): `n` counts
+                            -- YOUR OWN observed spawns only, so a shared claim can never combine
+                            -- with one personal sighting to fake a verified spot. The coords are
+                            -- the gift; verification is still earned by watching it spawn twice.
+                            if type(c.locs) == "table" and #c.locs > 0 then
+                                e.locs = {}
+                                for _, L in ipairs(c.locs) do
+                                    if L.y and L.x then
+                                        e.locs[#e.locs + 1] = { y = L.y, x = L.x, z = L.z, n = 0, shared = true }
+                                    end
+                                end
+                            end
                             if type(c.ph) == "table" and #c.ph > 0 then e.ph = c.ph end
                             if c.spotRadius then e.spotRadius = c.spotRadius end
                         end

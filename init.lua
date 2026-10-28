@@ -321,7 +321,8 @@
 --        tooltip (no horizontal scrollbars); the same tooltip teaches the attribution color.
 -- v1.08: FIX leaderboard tooltip error "invalid option '%n' to 'format'" - SetTooltip printf-formats
 --        its string, and this tooltip contained a literal % ("38% named rate"). Dynamic tooltips now
---        use a BeginTooltip block (Text does not reformat). Gotcha recorded in root CLAUDE.md.
+--        use a BeginTooltip block (Text does not reformat). Rule: SetTooltip only for fixed,
+--        %-free text; anything built at runtime goes in BeginTooltip/Text/EndTooltip.
 -- v1.09: session attribution DONUT in Stats > This Session - a 40px mini-pie of who landed the
 --        session's kills (you purple / pets teal / grp green / outsiders yellow, matching the ledger
 --        colors), with a color-keyed tooltip. Draw-list arcs per the buttonmaster cooldown-pie
@@ -536,6 +537,22 @@
 --        would fake a verified spot). So a share file is a map, not evidence: it tells you where
 --        to camp, and your own two sightings still earn the watch. Sidebar labels the three
 --        states (verified xN / shared / unverified), each tooltip-taught.
+-- v1.47: MQ's imgui.Selectable returns (selected, pressed), and `if imgui.Selectable(...)` tested
+--        the FIRST - true every frame for the row already chosen. Two effects: the Options Theme
+--        list ran saveAll() (a full save-file write) on every frame it was open, and the Camps row
+--        toggle could never close. That toggle had a second bug on top - `sel and nil or e.name`
+--        can never return nil - and fixing either alone was not enough: with the old test, a
+--        correct toggle would have cleared the selection the frame after it was made. Both sites
+--        now act on `pressed`; clicking an open row closes its detail panel. Also: the v1.08
+--        comment that pointed at a local-only note now states its rule inline.
+-- v1.48: FIX named missing from the Hunter roster (AL: "The Blazing Hen" never showed in
+--        Lceanium). ObjectiveByIndex looks objectives up by SEQUENCE NUMBER - a label from the
+--        game's data - not by position, and those labels can start at 0 and can skip numbers.
+--        The 1..count loop (in place since v0.10, whose "1-based" note held only for the common
+--        case) could never reach label 0 or anything pushed past the count by a gap: 78 of the
+--        objectives across the game's 417 Hunter achievements. Now walks labels up from 0 until
+--        every objective is found. Nothing to migrate - each zone's load on entry adds only what
+--        is missing, so affected zones fill themselves in on the next visit.
 
 local mq     = require('mq')
 local imgui  = require('ImGui')
@@ -548,7 +565,7 @@ if not okCatalog or type(catalog) ~= 'table' or type(catalog.zones) ~= 'table' t
     catalog = { version = 0, zones = {} }
 end
 
-local VERSION   = '1.46'
+local VERSION   = '1.48'
 local launchArg = ...
 local myServer  = mq.TLO.EverQuest.Server() or ""
 
@@ -1035,9 +1052,17 @@ local function loadFromAchievement(quiet)
     local ach   = mq.TLO.Achievement(achID)
     local count = ach.ObjectiveCount() or 0
     local added = 0
-    for i = 1, count do   -- ObjectiveByIndex is 1-BASED (verified MQ docs) - the old 0-based loop added nothing
-        local objName = ach.ObjectiveByIndex(i)()
+    -- ObjectiveByIndex[n] returns the objective whose SEQUENCE NUMBER is n - a label Daybreak
+    -- assigns, not a position. Labels can start at 0 (Hunter of Lceanium) or at 7 (Timorous
+    -- Deep), and can skip (Plane of Valor has no 4), so asking for 1..count missed 78 objectives
+    -- game-wide. Walk the labels up from 0 until every objective has turned up; a label with no
+    -- objective comes back empty and is skipped. The cap only guards against bad data - the
+    -- widest gap in the game's own data ends 6 past the count.
+    local found, seq = 0, 0
+    while found < count and seq <= count + 64 do
+        local objName = ach.ObjectiveByIndex(seq)()
         if objName and objName ~= "" then
+            found = found + 1
             local inGame = nameMap[objName] or objName
             local key    = dbKey(curZoneShort, inGame)
             if not db[key] then
@@ -1045,6 +1070,7 @@ local function loadFromAchievement(quiet)
                 added = added + 1
             end
         end
+        seq = seq + 1
     end
     if added > 0 then
         saveAll()
@@ -1947,8 +1973,12 @@ end
 local function renderLeanRow(e)
     local sel   = (selectedName == e.name)
     local p     = imgui.GetCursorScreenPosVec()
-    if imgui.Selectable("##row" .. e.name, sel) then
-        selectedName = sel and nil or e.name
+    -- Selectable returns (selected, pressed); only `pressed` is a click. The first return is true
+    -- every frame for the open row, so a toggle tested on it would close the row the frame after
+    -- opening it. And not `sel and nil or e.name` - `true and nil` is nil, so that is always e.name.
+    local _, pressed = imgui.Selectable("##row" .. e.name, sel)
+    if pressed then
+        if sel then selectedName = nil else selectedName = e.name end
     end
     if imgui.IsItemHovered() then   -- teach the row's shorthand, especially the @xN spot badge
         local nv = 0
@@ -2897,7 +2927,8 @@ local function renderOptionsTab()
             imgui.SetNextItemWidth(220)
             if imgui.BeginCombo("##cwtheme", curTheme) then
                 for _, name in ipairs(THEME_NAMES) do
-                    if imgui.Selectable(name, name == curTheme) then
+                    local _, pressed = imgui.Selectable(name, name == curTheme)
+                    if pressed then   -- not the first return: that re-saved every frame the list was open
                         curTheme = name
                         saveAll()
                     end

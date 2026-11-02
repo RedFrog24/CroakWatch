@@ -3,6 +3,7 @@
 *.md
 !README.md
 backup/
+docs/
 tools/
 design/
 .luacheckrc

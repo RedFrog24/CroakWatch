@@ -553,6 +553,30 @@
 --        objectives across the game's 417 Hunter achievements. Now walks labels up from 0 until
 --        every objective is found. Nothing to migrate - each zone's load on entry adds only what
 --        is missing, so affected zones fill themselves in on the next visit.
+-- v1.49: ZONE REPOP handling (the October 2026 EQ patch announces repops). A repop respawns every
+--        DEAD spawn at once, and CroakWatch learns respawn kill to kill - so a named killed before
+--        a repop and again after it taught a fake, too-short respawn. On "This zone is repopping
+--        now!" every DOWN named in the zone has its kill time and spot clocks cleared, so the next
+--        kill starts an honest clock; UP named are untouched. The "will repop in N min" warning
+--        posts a Camp Watch line (chime, console per its toggle) and a [REPOP m:ss] countdown on
+--        the zone line. Only the actual repop line touches data - a warning alone changes nothing.
+-- v1.50: Loot lines anchored on "--". The loot event began with a wildcard, so MQ tried it against
+--        EVERY chat line, and its last-resort parse accepted "I just looted a Rusty Sword." from
+--        guild chat, OOC or a tell: a fake Recent Drops entry, and a Loot Watch alert if the item
+--        was watched. Real loot lines always start with "--" (it is in the game's own templates;
+--        547 of 547 in a cazic log) and a player's line starts with their name.
+-- v1.51: Items that take "an" were never seen. The game's loot template is "--You have looted %1
+--        %2 from %3.--" with %1 the ARTICLE, but the event and every parse demanded "looted a ", so
+--        "looted an Orbweaver Silk" failed both - 88 of 547 real loot lines (~16%) never reached
+--        Loot Watch, Recent Drops, per-named loot or the coin values. Now "an?" throughout; run
+--        against all 547 logged lines: 547 parse (was 459), and the 459 come out identical.
+-- v1.52: Named whose name has an apostrophe never showed UP (Spiritmaster Tala'Tak, Gates of
+--        Kor-Sha). EQ writes every apostrophe in a spawn name as a BACKTICK - "Tala`Tak" - but 20
+--        Hunter objectives spell it with an apostrophe, so the name taken from the achievement
+--        matched nothing. Names are now respelled with backticks on load, and saved rows are
+--        re-keyed once. Also fixed the Xetheg correction, keyed to "Warder" while the achievement
+--        says "Warden", so it never fired; three corrections the new rule or a fixed achievement
+--        made redundant were dropped.
 
 local mq     = require('mq')
 local imgui  = require('ImGui')
@@ -565,7 +589,7 @@ if not okCatalog or type(catalog) ~= 'table' or type(catalog.zones) ~= 'table' t
     catalog = { version = 0, zones = {} }
 end
 
-local VERSION   = '1.48'
+local VERSION   = '1.52'
 local launchArg = ...
 local myServer  = mq.TLO.EverQuest.Server() or ""
 
@@ -596,12 +620,10 @@ local PH_THRESHOLD        = 2    -- distinct spawns on the spot before a mob is 
 local PH_DWELL            = 60   -- seconds the SAME mob (by spawn ID) must hold the spot to count as
                                  -- a placeholder rather than a passer-by (v1.43, the Chirid fix)
 
--- Achievement objective name -> in-game spawn name corrections
+-- Achievement objective name -> in-game spawn name, where the WORDS differ. Apostrophes are not
+-- listed here: spawnName() turns every one into the backtick EQ uses in spawn names.
 local nameMap = {
-    ["Pli Xin Liako"]           = "Pli Xin Laiko",
-    ["Xetheg, Luclin's Warder"] = "Xetheg, Luclin`s Warder",
-    ["Itzal, Luclin's Hunter"]  = "Itzal, Luclin`s Hunter",
-    ["Ol' Grinnin' Finley"]     = "Ol` Grinnin` Finley",
+    ["Xetheg, Luclin's Warden"] = "Xetheg, Luclin's Warder",
 }
 
 -- Zone ID -> achievement ID where the name lookup fails
@@ -783,6 +805,13 @@ local function dbKey(zone, name)
     return zone .. "|" .. name
 end
 
+-- A name as the SPAWN spells it. EQ writes an apostrophe in a spawn name as a backtick
+-- ("Spiritmaster Tala`Tak"), while some achievement objectives and most people typing a name use
+-- the apostrophe, which then matches nothing. The extra parentheses keep only gsub's first return.
+local function spawnName(n)
+    return ((nameMap[n] or n):gsub("'", "`"))
+end
+
 -- Era-aware zone key (v1.19): Hardcore Heritage zones keep the base short name + Zone ID but are
 -- DIFFERENT content (level ~110 vs classic; own timers/loot). The zone display name is the tell
 -- ("The Reinforced Ruins of Sebilis") - HH gets its own book, e.g. "sebilis#hh", so the eras
@@ -947,6 +976,22 @@ local function loadAll()
             db[key] = e
         end
     end
+    -- Migration (v1.52): rows saved under a spelling the spawn never uses could not go UP, be
+    -- credited a kill or collect loot - so there is nothing in one worth merging. Re-key each to
+    -- spawnName's spelling; if that row already exists, the stale one just goes. Collected first,
+    -- because adding keys to a table while pairs() walks it is undefined in Lua.
+    local respelled = {}
+    for key, e in pairs(db) do
+        local want = spawnName(e.name)
+        if want ~= e.name then respelled[#respelled + 1] = { key, e, want } end
+    end
+    for _, r in ipairs(respelled) do
+        local key, e, want = r[1], r[2], r[3]
+        db[key] = nil
+        local newKey = dbKey(key:match("^[^|]*"), want)
+        if not db[newKey] then e.name = want; db[newKey] = e end
+        migrated = true
+    end
     lootWatch = saved.loot or {}
     catalogSeen = saved.catseen or {}
     if saved.theme and THEMES[saved.theme] then curTheme = saved.theme end
@@ -1063,7 +1108,7 @@ local function loadFromAchievement(quiet)
         local objName = ach.ObjectiveByIndex(seq)()
         if objName and objName ~= "" then
             found = found + 1
-            local inGame = nameMap[objName] or objName
+            local inGame = spawnName(objName)
             local key    = dbKey(curZoneShort, inGame)
             if not db[key] then
                 db[key] = newEntry(inGame, objName, curZoneShort, false)
@@ -1096,6 +1141,7 @@ local watchNewCount = 0        -- count since last acknowledge (the "(N new)" ba
 local watchOpen     = false    -- footer section expanded?
 local watchSound    = true     -- Camp Watch sound toggle (also gated by global soundOn)
 local watchEcho     = true     -- intruder lines also echo to the MQ console (feed always gets them)
+local repopDue      = nil      -- os.time() a zone repop was announced for (drives the header countdown)
 local lastWatchSound = 0       -- throttle: ms of the last OOC/zone chime (tells bypass it)
 -- Per-event sounds (swap the filenames to any WAV in assets/sounds/).
 local SOUND_DIR  = (((mq.luaDir or '') .. '/croakwatch/assets/sounds/'):gsub('\\', '/'))
@@ -1403,15 +1449,22 @@ mq.event("cw_active",   "#*# has slain #*#!",          function(line)
     if n and k ~= "You" then onKill(n, k) end
 end)
 -- Real EQ loot line: "--You have looted a <item>.--" / "--<name> has looted a <item>.--"
--- (verified against aquietone/grimmier loot scripts). Coarse #*# filter, parse in Lua so
--- multi-word item names survive (#1# captures one word only).
-mq.event("cw_loot", "#*#looted a #*#", function(line)
-    local looter = line:match("%-%-(.-) ha%a+ looted a ") or "?"
-    -- cazic EMU/HH form: "...looted a <item> from <corpse>'s corpse." (corpse named in the line!)
-    -- Live form: "...looted a <item>." (no corpse). Try the EMU form first, fall back to plain.
-    local item, corpse = line:match("looted a (.-) from (.+) corpse")
+-- (the game's own message templates, confirmed in a real log). Parse in Lua so multi-word item names
+-- survive (#1# captures one word only). The pattern starts with "--" because MQ only anchors a
+-- pattern to the START of a line when it begins with literal text: the old "#*#looted a #*#" was
+-- tried against every line, and its last-resort parse below accepted a player saying "I looted a
+-- Rusty Sword." in guild chat - a fake drop, and a Loot Watch alert if the item was watched. The
+-- dashes are part of the game's own templates ("--You have looted %1 %2 from %3.--"), and every one
+-- of 547 real loot lines in a cazic log starts with them; a player's line starts with their name.
+-- The article is a template value too - "a" OR "an" - so every pattern takes "an?". Requiring
+-- "looted a " missed every "an" item ("looted an Orbweaver Silk"): 88 of 547 real lines, ~16%.
+mq.event("cw_loot", "--#*#looted #*#", function(line)
+    local looter = line:match("%-%-(.-) ha%a+ looted ") or "?"
+    -- Current form names the corpse: "...looted a <item> from <corpse>'s corpse.--"; an older form
+    -- omits it: "...looted a <item>.--". Try the corpse form first, then fall back to plain.
+    local item, corpse = line:match("looted an? (.-) from (.+) corpse")
     if corpse then corpse = corpse:gsub("'s?$", "")
-    else item = line:match("looted a (.-)%.%-%-") or line:match("looted a (.+)%.") end
+    else item = line:match("looted an? (.-)%.%-%-") or line:match("looted an? (.+)%.") end
     if item then onLoot(item, looter, corpse) end
 end)
 -- Coin looted: corpse loot + group splits ONLY ("from the corpse" / "as your split" - deliberately
@@ -1444,6 +1497,48 @@ mq.event("cw_tell", "#*# tells you, #*#", function(line)
         watchPush("tell", string.format('%s: "%s"', who, msg), who)
     end
 end)
+-- Zone repop (Live, Oct 2026 patch). The game's text, from its own string table:
+--   "<ZONE MESSAGE>: This zone will repop in %1 min(s). Please move to a safe location."
+--   "<ZONE MESSAGE>: This zone is repopping now!"
+-- MQ only anchors an event to the START of a line when the pattern starts with literal text; one
+-- starting with #*# is tried against every line - so a player typing these words in OOC or a tell
+-- would fire it, and the repop handler wipes timers. Hence two anchored patterns per message, with
+-- and without the prefix (whether it reaches the chat line is unconfirmed). A player's line starts
+-- with their name, so it can never begin with "<" or with "This zone".
+local function onRepopWarn(_, mins)
+    local m = tonumber(mins)
+    if not m then return end
+    repopDue = os.time() + m * 60
+    local msg = string.format("Zone repops in %d min - every DEAD named comes back with it", m)
+    if watchEcho then warn(msg) end
+    watchPush("repop", msg)
+end
+mq.event("cw_repop_warn", "This zone will repop in #1# min#*#", onRepopWarn)
+mq.event("cw_repop_warn_z", "<ZONE MESSAGE>: This zone will repop in #1# min#*#", onRepopWarn)
+-- A repop respawns every DEAD spawn at once, so a down named's clock is meaningless the moment it
+-- fires - and if it stayed, the next kill would learn a fake, too-short respawn (respawn is learned
+-- kill to kill). Clearing the kill time means that next kill starts a fresh, honest clock instead.
+-- Named that are UP are untouched: a repop only respawns the dead. The placeholder spot clocks are
+-- cleared for the same reason - a spot refilled by the repop is not a measured respawn.
+local function onRepopNow()
+    repopDue = nil
+    local reset = 0
+    for _, e in ipairs(roster) do
+        if not e.isUp then
+            if e.killTime then reset = reset + 1 end
+            e.killTime, e.alerted = nil, false
+            e.spotEmptyTime, e.spotPendingIv = nil, nil
+        end
+    end
+    if reset > 0 then saveAll() end
+    local msg = reset > 0
+        and string.format("Zone repopping - %d named timer(s) reset, so no fake respawn is learned", reset)
+        or "Zone repopping - no named timers were running"
+    if watchEcho then info(msg) end
+    watchPush("repop", msg)
+end
+mq.event("cw_repop_now", "This zone is repopping now#*#", onRepopNow)
+mq.event("cw_repop_now_z", "<ZONE MESSAGE>: This zone is repopping now#*#", onRepopNow)
 
 -- Name-poll: for a named we have NOT located yet. Polls by unique name only to detect it
 -- the first time and capture its loc; once loc exists, pollSpot takes over for that named.
@@ -2270,9 +2365,10 @@ local function renderAddPopup()
         addOverride = imgui.InputInt("Override min (0=auto)", addOverride)
         if addOverride < 0 then addOverride = 0 end
         if imgui.Button("Add##do") and addName ~= "" then
-            local key = dbKey(curZoneShort, addName)
+            local nm  = spawnName(addName)
+            local key = dbKey(curZoneShort, nm)
             if not db[key] then
-                local e = newEntry(addName, addName, curZoneShort, true)
+                local e = newEntry(nm, addName, curZoneShort, true)
                 e.ph       = splitCSV(addPH)
                 e.override = addOverride > 0 and addOverride * 60 or nil
                 db[key] = e
@@ -2714,7 +2810,8 @@ local function renderCampWatch()
             end
             local r, g, b = 0.34, 0.78, 0.78
             if e.kind == "tell" then r, g, b = 0.42, 0.80, 0.37
-            elseif e.kind == "zone" then r, g, b = 0.91, 0.72, 0.31 end
+            elseif e.kind == "zone" then r, g, b = 0.91, 0.72, 0.31
+            elseif e.kind == "repop" then r, g, b = 0.95, 0.65, 0.30 end
             imgui.PushStyleColor(ImGuiCol.Text, r, g, b, 1)
             imgui.TextWrapped(string.format("[%s] %s  %s", e.t, e.kind, e.text))
             imgui.PopStyleColor()
@@ -2961,6 +3058,15 @@ local function renderOptionsTab()
             renderQuickReplies()
 end
 
+-- The repop countdown badge on the zone line. Its own function so renderMain - the closest function
+-- in the file to Lua 5.1's 60-upvalue limit - pays one upvalue for it instead of two.
+local function renderRepopBadge()
+    local left = repopDue and (repopDue - os.time()) or 0
+    if left <= 0 then return end
+    imgui.SameLine(); imgui.TextColored(0.95, 0.65, 0.30, 1, "[REPOP " .. fmtClock(left) .. "]")
+    if imgui.IsItemHovered() then imgui.SetTooltip("The game announced a zone repop. When it fires, every DEAD named\nrespawns at once - and CroakWatch resets their timers, so the\nkills after it never teach it a fake, too-short respawn.") end
+end
+
 local function renderMain()
     local nc, nv = pushTheme()
     imgui.SetNextWindowSizeConstraints(650, 200, 650, 4000)   -- locked 650 width (was 520) for the master-detail layout; height resizable
@@ -3043,6 +3149,7 @@ local function renderMain()
         imgui.SameLine(); imgui.TextColored(0.95, 0.65, 0.30, 1, "[HH]")
         if imgui.IsItemHovered() then imgui.SetTooltip("Hardcore Heritage zone - same zone, DIFFERENT mobs (level-scaled\nevent versions). CroakWatch keeps a separate book for the HH era:\nits own named, timers and loot, reopened intact each HH season.\nThe classic zone's data is untouched.") end
     end
+    renderRepopBadge()
     imgui.SameLine(0, 18)   -- zone watch joins the zone line: one full-width info row
     zoneWatch = imgui.Checkbox("##zonewatch", zoneWatch)
     if imgui.IsItemHovered() then imgui.SetTooltip("Zone watch - alert when non-group players enter the zone\n(sound + warning) or leave it (quiet note - they zoned,\ncamped or died; the spawn list can't tell which)") end
@@ -3534,6 +3641,7 @@ while running do
         catalogNotice()
         zonePcs, zonePcsList, zonePcsBaseline = {}, {}, false   -- re-adopt the new zone's crowd silently
         watchFeed, watchUnread, watchNewCount = {}, false, 0     -- last camp's OOC/intruder lines are stale
+        repopDue = nil                                           -- a repop belongs to the zone that announced it
         selectedName = nil                                       -- close any open detail panel from the old zone
         editFor, notesDirty = nil, false                         -- drop stale sidebar edit buffers (same-name mob in the new zone must reload)
         lastZone = z

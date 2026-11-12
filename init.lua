@@ -577,6 +577,17 @@
 --        re-keyed once. Also fixed the Xetheg correction, keyed to "Warder" while the achievement
 --        says "Warden", so it never fired; three corrections the new rule or a fixed achievement
 --        made redundant were dropped.
+-- v1.53: The text-to-speech plugin now loads with "noauto". Before, loading it also saved it into
+--        the user's MacroQuest.ini, so it loaded for every character at every client start, long
+--        after CroakWatch closed. Now it loads for this session only. Also: catalog.lua's version
+--        moved from an unused runtime field to its header comment.
+-- v1.54: Quiet zones + a resizable Camp Watch (a user's request, after a week of use). In a quiet
+--        zone - the hubs nobody camps in - Camp Watch no longer announces players arriving or
+--        leaving and skips OOC; tells still come through and still chime. It only quiets
+--        CroakWatch's own copy: the game's chat window shows everything as before. Seeded with
+--        PoK, the Guild Lobby, the Bazaar, the guild halls and Sunrise Hills; Options > Quiet
+--        Zones adds or removes any zone. The feed now keeps 500 lines (was 150), and a drag
+--        handle on its top edge sets its height, remembered between sessions.
 
 local mq     = require('mq')
 local imgui  = require('ImGui')
@@ -586,10 +597,10 @@ local actors = require('actors')
 -- pcall so a missing/broken file just means "no catalog", never a crash.
 local okCatalog, catalog = pcall(require, 'croakwatch.catalog')
 if not okCatalog or type(catalog) ~= 'table' or type(catalog.zones) ~= 'table' then
-    catalog = { version = 0, zones = {} }
+    catalog = { zones = {} }
 end
 
-local VERSION   = '1.52'
+local VERSION   = '1.54'
 local launchArg = ...
 local myServer  = mq.TLO.EverQuest.Server() or ""
 
@@ -655,6 +666,8 @@ local sessionCroaks = { self = 0, pet = 0, grp = 0, other = 0 }   -- this sessio
 local roster       = {}    -- array of db entries for the current zone (rebuilt on zone change)
 local lootWatch    = {}    -- global per-server list of { item, count }
 local quickReplies = {}    -- per-server preset reply strings (Camp Watch quick-reply)
+local quietZones   = {}    -- set of zone short names where Camp Watch stays quiet (hubs nobody camps in)
+local watchH       = 120   -- Camp Watch feed height in px, set by dragging its top edge
 local curAchID     = nil
 local curZoneShort = ""
 local running      = true
@@ -937,7 +950,7 @@ local function saveAll()
     end
     mq.pickle(SAVE_FILE, { named = out, loot = lootWatch, replies = quickReplies, coin = coinTotal,
         itemval = lootValTotal, tribute = tribTotal, croaks = croakLog, catseen = catalogSeen,
-        theme = curTheme, schema = 61 })
+        theme = curTheme, quiet = quietZones, watchh = watchH, schema = 61 })
 end
 
 local function loadAll()
@@ -1006,6 +1019,13 @@ local function loadAll()
         "Camp's taken, sorry", "Yes camping here - welcome to join",
         "Open after my drop", "AFK, back shortly", "Live and camping here",
     }
+    -- Seeded once with the hubs where nobody camps; after that the list is the user's. Removing every
+    -- zone saves as {} rather than nil, so an emptied list stays empty instead of reseeding.
+    quietZones = saved.quiet or {
+        poknowledge = true, guildlobby = true, bazaar = true, neighborhood = true,
+        guildhall = true, guildhall3 = true, guildhallsml = true, guildhalllrg = true,
+    }
+    watchH = tonumber(saved.watchh) or 120
     for _, w in ipairs(lootWatch) do w.count = w.count or 0 end
     if oldSchema < 61 then migrated = true end   -- stamp schema=61 so the v0.61 interval reset runs once
     if migrated then saveAll() end   -- persist the cleanup immediately
@@ -1135,7 +1155,7 @@ local zonePcs         = {}     -- last-seen set of other-player names, for the n
 local zonePcsList     = {}     -- {name, level, class, guild} for the hover tooltip
 local zonePcsBaseline = false  -- first scan after load/zone-change adopts silently (no alert spam)
 -- Camp Watch: in-memory feed (intruder + OOC + tells) for the bottom footer. Clears on restart.
-local watchFeed     = {}       -- ring buffer { {t, kind, text} }, capped 150, newest appended
+local watchFeed     = {}       -- ring buffer { {t, kind, text} }, capped 500, newest appended
 local watchUnread   = false    -- drives the blinking header (set on new event, cleared on expand)
 local watchNewCount = 0        -- count since last acknowledge (the "(N new)" badge)
 local watchOpen     = false    -- footer section expanded?
@@ -1212,11 +1232,18 @@ local function namedUpAlert(name, where)
     end
 end
 
+-- Quiet zones: hubs nobody camps in. Arrivals, departures and OOC stay out of Camp Watch there; tells
+-- still come through. Only CroakWatch's copy is quieted - an mq.event never removes a line from the
+-- game's chat. Keyed by the plain short name: a hub has no HH era, so no "#hh" key to match.
+local function isQuietZone()
+    return quietZones[(mq.TLO.Zone.ShortName() or ""):lower()] == true
+end
+
 -- Camp Watch: append one line to the feed + flag it unread (drives the blink). Sound rules:
 -- intruder ("zone") already plays its own; tells always knock; OOC is throttled to cut spam.
 local function watchPush(kind, text, who)
     watchFeed[#watchFeed + 1] = { t = os.date("%H:%M:%S"), kind = kind, text = text, who = who }
-    if #watchFeed > 150 then table.remove(watchFeed, 1) end
+    if #watchFeed > 500 then table.remove(watchFeed, 1) end
     watchUnread = true
     watchNewCount = watchNewCount + 1
     if kind ~= "zone" and watchSound then
@@ -1489,7 +1516,7 @@ mq.event("cw_coin_split",  "You receive #*# as your split#*#",   onCoin)
 -- OOC/tell strings are verified in-game (the event simply won't fire if a server's format differs).
 mq.event("cw_ooc", "#*# says out of character, #*#", function(line)
     local who, msg = line:match("^(.-) says out of character, '(.*)'")
-    if who and msg then watchPush("ooc", string.format('%s: "%s"', who, msg), who) end
+    if who and msg and not isQuietZone() then watchPush("ooc", string.format('%s: "%s"', who, msg), who) end
 end)
 mq.event("cw_tell", "#*# tells you, #*#", function(line)
     local who, msg = line:match("^(.-) tells you, '(.*)'")
@@ -1784,7 +1811,11 @@ local function pollZonePcs()
                                 class = sp.Class.ShortName() or "?", guild = sp.Guild() or "" }
         end
     end
-    if zonePcsBaseline then
+    -- A quiet zone still refreshes the list (the "N in zone" badge stays true) but announces nobody.
+    -- Because the list keeps updating, un-quieting a zone mid-visit doesn't flood the feed.
+    if not zonePcsBaseline then
+        zonePcsBaseline = true
+    elseif not isQuietZone() then
         for _, p in ipairs(list) do
             if not zonePcs[p.name] then
                 local desc = string.format("%s (%d %s)%s entered the zone", p.name, p.level, p.class,
@@ -1806,8 +1837,6 @@ local function pollZonePcs()
                 watchPush("zone", desc)
             end
         end
-    else
-        zonePcsBaseline = true
     end
     zonePcs, zonePcsList = now, list
 end
@@ -2770,8 +2799,30 @@ end
 
 -- Camp Watch footer: blinking header (pulses even when collapsed) + the unified feed. Clicking the
 -- header toggles + acknowledges (stops the blink). A camp-safety glance for AFK.
-local function renderCampWatch()
-    imgui.Separator()
+local function renderCampWatch(feedH, feedMax)
+    if watchOpen then
+        -- Drag handle on the feed's top edge, standing in for the separator line while the feed is
+        -- open. Drag up = taller. The height is saved on release, not on every frame of the drag.
+        local x, y = imgui.GetCursorScreenPos()
+        local w = math.max(1, (imgui.GetContentRegionAvail()))
+        imgui.InvisibleButton("##watchgrip", w, 6)
+        local held, hover = imgui.IsItemActive(), imgui.IsItemHovered()
+        -- grows from the height SHOWN this frame (MouseDelta.y < 0 = moving up), so a feed the window
+        -- has squeezed below its saved height responds at once instead of after a dead zone
+        if held then watchH = math.max(60, math.min(feedH - imgui.GetIO().MouseDelta.y, feedMax)) end
+        if imgui.IsItemDeactivated() then saveAll() end
+        if held or hover then imgui.SetMouseCursor(ImGuiMouseCursor.ResizeNS) end
+        if hover and not held then imgui.SetTooltip("drag to resize the Camp Watch feed - up for taller,\ndown for shorter. CroakWatch remembers the height.") end
+        -- the second argument matters: with ONE number GetColorU32 reads it as a raw color,
+        -- not a style slot, and the line comes out invisible
+        local col = imgui.GetColorU32(held and ImGuiCol.SeparatorActive or hover and ImGuiCol.SeparatorHovered
+            or ImGuiCol.Separator, 1.0)
+        local dl = imgui.GetWindowDrawList()
+        dl:AddLine(ImVec2(x, y + 3), ImVec2(x + w, y + 3), col)
+        dl:AddRectFilled(ImVec2(x + w / 2 - 18, y + 1), ImVec2(x + w / 2 + 18, y + 5), col, 2)   -- the grip
+    else
+        imgui.Separator()
+    end
     if watchUnread then
         local p = 0.5 + 0.5 * math.sin(mq.gettime() / 150)
         imgui.PushStyleColor(ImGuiCol.Text, 0.93, 0.74, 0.33, 0.45 + 0.55 * p)
@@ -2785,12 +2836,16 @@ local function renderCampWatch()
         watchOpen = not watchOpen
         if watchOpen then watchUnread = false; watchNewCount = 0 end
     end
+    if isQuietZone() then
+        imgui.SameLine(); imgui.TextDisabled("- quiet zone")
+        if imgui.IsItemHovered() then imgui.SetTooltip("Quiet zone - nobody camps here, so Camp Watch skips players\narriving and leaving, and OOC. Tells still come through.\nOnly CroakWatch is quieted: your chat window shows\neverything as usual. Options > Quiet Zones edits the list.") end
+    end
     if watchOpen then   -- Camp Watch sound toggle moved to Options > Sounds
         imgui.SameLine(imgui.GetWindowWidth() - 64)
         if imgui.SmallButton("Clear") then watchFeed, watchUnread, watchNewCount = {}, false, 0 end
     end
     if watchOpen then
-        imgui.BeginChild("##watchfeed", 0, 120, true)
+        imgui.BeginChild("##watchfeed", 0, feedH, true)
         if #watchFeed == 0 then imgui.TextDisabled("  (quiet - nothing yet)") end
         for i = #watchFeed, 1, -1 do
             local e = watchFeed[i]
@@ -3044,6 +3099,31 @@ local function renderOptionsTab()
             if imgui.IsItemHovered() then imgui.SetTooltip("also echo 'X entered the zone' lines to the MQ console -\nuncheck to keep them ONLY in the Camp Watch feed below") end
             renderSoundTest()
             imgui.Separator()
+            gold("Quiet Zones")
+            imgui.TextDisabled("  No arrival, departure or OOC noise in these zones. Tells still come through.")
+            local here = (mq.TLO.Zone.ShortName() or ""):lower()
+            if here ~= "" then
+                local quiet = quietZones[here] == true
+                if imgui.Button((quiet and "Un-quiet this zone (" or "Quiet this zone (") .. here .. ")") then
+                    quietZones[here] = (not quiet) or nil
+                    saveAll()
+                end
+                if imgui.IsItemHovered() then imgui.SetTooltip(quiet
+                    and "Camp Watch goes back to announcing players arriving\nand leaving here, and to showing OOC."
+                    or "Camp Watch stops announcing players arriving and leaving\nhere and skips OOC. Tells still come through, and the\ngame's own chat window is untouched.") end
+            end
+            local names = {}
+            for z in pairs(quietZones) do names[#names + 1] = z end
+            table.sort(names)
+            if #names == 0 then imgui.TextDisabled("  (none - Camp Watch speaks up in every zone)") end
+            for _, z in ipairs(names) do
+                if imgui.SmallButton("x##qz" .. z) then quietZones[z] = nil; saveAll() end
+                if imgui.IsItemHovered() then imgui.SetTooltip("remove from quiet zones - Camp Watch speaks up there again") end
+                imgui.SameLine(); imgui.Text(z)
+                local long = mq.TLO.Zone(z).Name()
+                if long and long ~= "" and long:lower() ~= z then imgui.SameLine(); imgui.TextDisabled("- " .. long) end
+            end
+            imgui.Separator()
             gold("Sharing")
             if imgui.Button("Export camp knowledge") then exportShare() end
             if imgui.IsItemHovered() then imgui.SetTooltip("writes Config/croakwatch/cw_share_<server>_<date>.lua - named,\nlocs, PH lists and learned respawns from EVERY zone book on this\nserver. NO personal history (kills, loot, coin and notes stay\nhome). Post the file on RG or Discord for others on your server.") end
@@ -3152,7 +3232,7 @@ local function renderMain()
     renderRepopBadge()
     imgui.SameLine(0, 18)   -- zone watch joins the zone line: one full-width info row
     zoneWatch = imgui.Checkbox("##zonewatch", zoneWatch)
-    if imgui.IsItemHovered() then imgui.SetTooltip("Zone watch - alert when non-group players enter the zone\n(sound + warning) or leave it (quiet note - they zoned,\ncamped or died; the spawn list can't tell which)") end
+    if imgui.IsItemHovered() then imgui.SetTooltip("Zone watch - alert when non-group players enter the zone\n(sound + warning) or leave it (quiet note - they zoned,\ncamped or died; the spawn list can't tell which).\nNot in quiet zones like PoK - see Options > Quiet Zones.") end
     imgui.SameLine()
     if zoneWatch then
         local n = #zonePcsList
@@ -3200,7 +3280,15 @@ local function renderMain()
 
     -- Tab area (everything between the header and the pinned Camp Watch footer). The footer is drawn
     -- after this child so it stays at the bottom regardless of which tab is active.
-    local footerH = imgui.GetFrameHeightWithSpacing() + 6 + (watchOpen and 132 or 0)   -- slim padding: Camp Watch hugs the true bottom
+    -- Footer sizing is settled HERE, before the tab area, so both agree on the line between them. The
+    -- feed shows at the user's dragged height, but never so tall the tabs shrink below 120px (the saved
+    -- height is kept, so it returns when the window grows). Open adds 17 beyond the feed: 12 below it,
+    -- plus 5 because the 6px drag handle stands where a 1px separator used to.
+    local footerH = imgui.GetFrameHeightWithSpacing() + 6   -- slim padding: Camp Watch hugs the true bottom
+    local _, availY = imgui.GetContentRegionAvail()
+    local feedMax = math.max(60, availY - footerH - 17 - 120)
+    local feedH = math.max(60, math.min(watchH, feedMax))
+    if watchOpen then footerH = footerH + feedH + 17 end
     imgui.BeginChild("##tabarea", 0, -footerH, false)
     if imgui.BeginTabBar("##cwtabs") then
         imgui.PushStyleColor(ImGuiCol.Text, 0.90, 0.76, 0.36, 1)   -- gold
@@ -3447,6 +3535,8 @@ local function renderMain()
             imgui.BulletText("Hidden mobs still track silently - the Hidden checkbox reveals them")
             imgui.BulletText("Loot Watch: plain text matches partially; \"quote it\" for one exact item")
             imgui.BulletText("HH / event zones keep their own book - the [HH] badge shows which is open")
+            imgui.BulletText("Camp Watch too short? Open it and drag the line on its top edge")
+            imgui.BulletText("Hubs like PoK are quiet zones: no arrival or OOC noise (Options > Quiet Zones)")
             imgui.Separator()
             gold("Version")
             imgui.TextColored(0.63, 0.47, 0.92, 1, "CroakWatch v" .. VERSION)
@@ -3457,7 +3547,7 @@ local function renderMain()
     end
     imgui.EndChild()
 
-    renderCampWatch()
+    renderCampWatch(feedH, feedMax)
 
     imgui.End(); imgui.PopStyleColor(nc); imgui.PopStyleVar(nv)
 end
@@ -3616,8 +3706,10 @@ catalogNotice()
 
 -- Load TTS for spoken Named alerts if it isn't already. We do NOT unload it on exit - unloading a
 -- plugin as the script terminates crashed the EQ client (v0.44, EMU where CW was the one to load it).
+-- "noauto" loads it for this session only: without it MQ writes the plugin into the user's
+-- MacroQuest.ini and it loads for every character at every start - not our setting to change.
 if not mq.TLO.Plugin(TTS_PLUGIN).IsLoaded() then
-    mq.cmd('/plugin ' .. TTS_PLUGIN)
+    mq.cmd('/plugin ' .. TTS_PLUGIN .. ' load noauto')
     mq.delay(500)
 end
 

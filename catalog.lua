@@ -7,9 +7,9 @@
 -- confirmed. NEVER guess respawn values - omit them until confirmed in-game.
 -- Import never overwrites tracked named; imported respawns land as HINTS (outranked by the
 -- user's own observed data). Sources noted per zone.
+-- Version: 1 (data vintage - bump when the catalog's contents change)
 
 return {
-    version = 1,
     zones = {
         -- Old Sebilis (classic + Hardcore Heritage share this short name; the HH zones keep the
         -- base zone ID/short name). Union of both eras - untracked extras are easy to ignore in

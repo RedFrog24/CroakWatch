@@ -588,6 +588,67 @@
 --        PoK, the Guild Lobby, the Bazaar, the guild halls and Sunrise Hills; Options > Quiet
 --        Zones adds or removes any zone. The feed now keeps 500 lines (was 150), and a drag
 --        handle on its top edge sets its height, remembered between sessions.
+-- v1.55: A named is only the mob with EXACTLY its name. MQ's spawn search matches a name anywhere
+--        inside another, so in the Overthere "Saber" also found every sabertooth: once Saber had
+--        a known spot she read UP whenever one was in zone, and Nav and click-to-target went to
+--        the nearest sabertooth. findNamed() now accepts only an exact clean-name match. Loot
+--        credit had the same flaw (15 Sabretooth Skulls credited to a Saber never killed): the
+--        corpse must now BE the named or one of its PHs, not merely contain the name.
+-- v1.56: Group members' loot is credited to the named's drop list. Only YOUR loot lines counted,
+--        so a multiboxer's tables showed about a third of the drops (356 of 547 loot lines in a
+--        real log were a box's). A member's line always names the corpse, which is what decides
+--        the camp; anyone outside your group is never credited. Item value and tribute stay
+--        yours only, since only your own bags can be read.
+-- v1.57: Recent Drops (Loot tab) keeps the last 500 drops and scrolls, where it showed only the
+--        newest 8 of 100. It also survives a restart now: drops are saved, batched into one
+--        write every ~10s rather than one per loot line, and older days get a date line. The
+--        copy of the same list in Stats > This Session is gone; the kill ledger takes its width.
+-- v1.58: Loot Watch shows the SHARED bank on its own: "inv N  bank N  shared N". MQ's bank count
+--        always included it, merged, so "bank 1" could not tell a copy this character holds from a
+--        spare Lore copy stashed in the account's shared bank. The shared slots (and the bags in
+--        them) are read once per refresh and subtracted from the bank count. Group members'
+--        counts stay merged - DanNet has nothing to ask for a shared-only count - and their
+--        hover now says so.
+-- v1.59: Structural pass, no change in behaviour. Lua allows 200 top-level locals and CroakWatch
+--        had 3 to spare, so 31 related names became four tables: TUNE (spot-tracking numbers),
+--        SOUND (sound files + the speech plugin), ui (what the user picked or typed) and edit (the
+--        detail panel's edit buffers). Now 170 of 200, and renderMain captures 51 of its 60.
+-- v1.60: Group counts (grp N/M) no longer go stale. A DanNet watch only sends a count when it
+--        CHANGES, and when a box camps or crashes it forgets the watch while the driver still
+--        calls it "set" - so the old number froze for days, and once the box numbered new
+--        watches from scratch, an old one could even carry another item's count (4 holders read
+--        as 3/6, a box with no spare read bank 1). CroakWatch now asks every box fresh at start,
+--        again whenever a box drops off DanNet or leaves the group, and every ~5 minutes. While a
+--        fresh answer is on the way, the last good count stays on screen, marked (re-checking).
+-- v1.61: Fix v1.60, which showed no group counts at all. DanNet hands a peer to ONE member read
+--        and then forgets it, and v1.60 saved mq.TLO.DanNet(peer) to read several members from
+--        it - every read after the first asked about nobody, so no box was ever counted.
+-- v1.62: Group counts are back to v1.59's way: ask each box once and keep the answer. v1.60's
+--        re-asking ran DanNet out of reply tickets. A client gets 256 for its whole session, and
+--        after that every request shares one, so requests sent together overwrite each other's
+--        reply handler and an answer lands on the wrong item. Re-asking 12 items x 5 boxes x 2
+--        counts at start and every 5 minutes used them up in minutes, and the counts then took
+--        8+ minutes to fill, wrong. Reload DanNet on the driver once to get fresh tickets.
+-- v1.63: Group counts ask DanNet ONE request at a time. Past a client's 256 tickets, requests out
+--        together can swap answers; v1.62 sent every missing watch at once and re-sent the
+--        unanswered ones every ~10s. Now the next request waits until the last one is answered (or
+--        20s pass), so CroakWatch's own requests can never cross, however many tickets are gone.
+--        A box that drops off DanNet has its watches forgotten here too, so they are asked again
+--        when it returns - a box coming back is what froze a count before. A box that stays silent
+--        gets ONE console warning with the DanNet reload. The grp column is dimmed with "..." until
+--        every box has answered, its hover says who is still being asked, and /croakwatch status
+--        shows how many requests CroakWatch has sent.
+-- v1.65: SAVED ITEM CARDS for Loot Watch. Hovering a watched item that only a groupmate holds
+--        used to say "no item data". Now the hover names who holds it, and Ctrl+Right-Click asks
+--        ONE of them for the item's link (one DanNet request, in the same one-at-a-time queue as
+--        the counts), opens the game's real item window from it, reads the item from that window,
+--        and saves the card on the Loot Watch row. From then on the hover shows the icon and
+--        details with no more requests, and Ctrl+Right-Click opens the window from the saved link.
+--        A watched item you hold saves its card on first hover too, so it survives selling it.
+--        Removing the watch removes its card.
+-- v1.64: Five code comments reworded to describe their technique in plain terms. No change in
+--        behaviour.
+-- v1.66: A sixth such comment, on the Stats donut, reworded the same way. No change in behaviour.
 
 local mq     = require('mq')
 local imgui  = require('ImGui')
@@ -600,7 +661,7 @@ if not okCatalog or type(catalog) ~= 'table' or type(catalog.zones) ~= 'table' t
     catalog = { zones = {} }
 end
 
-local VERSION   = '1.54'
+local VERSION   = '1.66'
 local launchArg = ...
 local myServer  = mq.TLO.EverQuest.Server() or ""
 
@@ -624,12 +685,16 @@ local ZONE_RESPAWN = {
 }
 local GLOBAL_RESPAWN = 20 * 60   -- neutral fallback when zone unknown; observation/override refine it
 
-local SPOT_RADIUS_DEFAULT = 30   -- units around a named's captured loc counted as "the spot"
-local KILL_RANGE       = 200     -- credit a kill only if the mob was last seen within this range (starting value - tune in field)
-local SPOT_TRUST_RANGE = 600     -- beyond this an EMPTY spot read means nothing (mob may just be out of client spawn range)
-local PH_THRESHOLD        = 2    -- distinct spawns on the spot before a mob is learned as a PH
-local PH_DWELL            = 60   -- seconds the SAME mob (by spawn ID) must hold the spot to count as
-                                 -- a placeholder rather than a passer-by (v1.43, the Chirid fix)
+-- Spot-tracking numbers. One table rather than five names: Lua allows a file only 200 top-level
+-- locals, and CroakWatch was 3 short of it (v1.59 grouped these and three other sets).
+local TUNE = {
+    spotRadius  = 30,    -- units around a named's captured loc counted as "the spot"
+    killRange   = 200,   -- credit a kill only if the mob was last seen within this range (starting value - tune in field)
+    trustRange  = 600,   -- beyond this an EMPTY spot read means nothing (mob may just be out of client spawn range)
+    phThreshold = 2,     -- distinct spawns on the spot before a mob is learned as a PH
+    phDwell     = 60,    -- seconds the SAME mob (by spawn ID) must hold the spot to count as
+                         -- a placeholder rather than a passer-by (v1.43, the Chirid fix)
+}
 
 -- Achievement objective name -> in-game spawn name, where the WORDS differ. Apostrophes are not
 -- listed here: spawnName() turns every one into the backtick EQ uses in spawn names.
@@ -661,17 +726,17 @@ local coinSession  = 0     -- this session's coin looted (copper)
 local lootValTotal, lootValSession = 0, 0   -- vendor value of items YOU looted (copper; total persisted)
 local tribTotal, tribSession = 0, 0         -- tribute value of items YOU looted (total persisted)
 local croakLog = {}    -- rolling named-kill ledger (PERSISTED; reloaded with a 24h age filter - the AFK audit)
-local dropLog  = {}    -- session-only rolling feed of loot-line drops
+local dropLog  = {}    -- rolling feed of loot-line drops, last 500 (PERSISTED since v1.57)
 local sessionCroaks = { self = 0, pet = 0, grp = 0, other = 0 }   -- this session's attribution tallies
 local roster       = {}    -- array of db entries for the current zone (rebuilt on zone change)
-local lootWatch    = {}    -- global per-server list of { item, count }
+local lootWatch    = {}    -- global per-server list of { item, count, card } (card = saved item card, v1.65)
 local quickReplies = {}    -- per-server preset reply strings (Camp Watch quick-reply)
 local quietZones   = {}    -- set of zone short names where Camp Watch stays quiet (hubs nobody camps in)
 local watchH       = 120   -- Camp Watch feed height in px, set by dragging its top edge
 local curAchID     = nil
 local curZoneShort = ""
 local running      = true
-local paused       = false   -- soft pause: loop stays alive, tracking work is gated (RGMercs pattern)
+local paused       = false   -- soft pause: loop stays alive, tracking work is gated by a guard clause
 -- Themes (TurnipBuy-style, inline): each entry names its ART suffix (assets/img/banner_<art>.png
 -- etc.); missing art falls back to the text header, never a crash. Per-theme color overrides
 -- join the table when the RedFrog/Blue Frog variants land - widget colors are shared for now.
@@ -935,6 +1000,7 @@ end
 
 local function saveAll()
     if monitorMode then return end   -- monitor instance: another CW owns this server's file
+    dropLog.unsaved = nil            -- every save carries the drops, so nothing is left pending
     local out = {}
     for key, e in pairs(db) do
         out[key] = {
@@ -949,7 +1015,7 @@ local function saveAll()
         }
     end
     mq.pickle(SAVE_FILE, { named = out, loot = lootWatch, replies = quickReplies, coin = coinTotal,
-        itemval = lootValTotal, tribute = tribTotal, croaks = croakLog, catseen = catalogSeen,
+        itemval = lootValTotal, tribute = tribTotal, croaks = croakLog, drops = dropLog, catseen = catalogSeen,
         theme = curTheme, quiet = quietZones, watchh = watchH, schema = 61 })
 end
 
@@ -1015,6 +1081,7 @@ local function loadAll()
     for _, c in ipairs(saved.croaks or {}) do
         if c.ts and os.time() - c.ts <= 86400 then croakLog[#croakLog + 1] = c end
     end
+    dropLog = saved.drops or {}   -- no age limit: the 500 cap set when each drop was added bounds it
     quickReplies = saved.replies or {
         "Camp's taken, sorry", "Yes camping here - welcome to join",
         "Open after my drop", "AFK, back shortly", "Live and camping here",
@@ -1163,16 +1230,19 @@ local watchSound    = true     -- Camp Watch sound toggle (also gated by global 
 local watchEcho     = true     -- intruder lines also echo to the MQ console (feed always gets them)
 local repopDue      = nil      -- os.time() a zone repop was announced for (drives the header countdown)
 local lastWatchSound = 0       -- throttle: ms of the last OOC/zone chime (tells bypass it)
--- Per-event sounds (swap the filenames to any WAV in assets/sounds/).
-local SOUND_DIR  = (((mq.luaDir or '') .. '/croakwatch/assets/sounds/'):gsub('\\', '/'))
-local WINDOW_WAV = 'window.wav'   -- stable name: swap the file's CONTENTS to change the sound (no orphans)
-local LOOT_WAV   = 'loot.wav'     -- "
-local INTRUDER_WAV = 'intruder.wav'   -- a new non-group player entered the zone
-local WATCH_WAV    = 'campwatch.wav'  -- Camp Watch notification (OOC / tell)
-local TTS_PLUGIN = 'MQTextToSpeech'
--- Common Windows voices. The plugin substring-matches (so "Zira" -> "Microsoft Zira") and doesn't
--- expose the installed list to scripts, so this is a curated set; users with others use /tts voice.
-local TTS_VOICES = { "David", "Zira", "Mark" }
+-- Per-event sounds (swap the filenames to any WAV in assets/sounds/), and the speech plugin. One
+-- table for the same 200-local reason as TUNE.
+local SOUND = {
+    dir      = (((mq.luaDir or '') .. '/croakwatch/assets/sounds/'):gsub('\\', '/')),
+    window   = 'window.wav',     -- stable names: swap a file's CONTENTS to change its sound (no orphans)
+    loot     = 'loot.wav',
+    intruder = 'intruder.wav',   -- a new non-group player entered the zone
+    watch    = 'campwatch.wav',  -- Camp Watch notification (OOC / tell)
+    ttsPlugin = 'MQTextToSpeech',
+    -- Common Windows voices. The plugin substring-matches (so "Zira" -> "Microsoft Zira") and doesn't
+    -- expose the installed list to scripts, so this is a curated set; users with others use /tts voice.
+    ttsVoices = { "David", "Zira", "Mark" },
+}
 
 -- Theme art (v1.28): PNGs under assets/img/, loaded once per art suffix via the PetGear
 -- pattern (mq.CreateTexture + Image). false = tried and missing -> the text header renders
@@ -1218,14 +1288,14 @@ end
 -- /beep <file> plays a WAV async via Windows PlaySound (verified in MQ source). Quote for spaces.
 local function playWav(file)
     if not soundOn then return end
-    mq.cmdf('/beep "%s%s"', SOUND_DIR, file)
+    mq.cmdf('/beep "%s%s"', SOUND.dir, file)
 end
 
 -- Named up: speak the name via TTS if available, else a double-beep fallback. Plus the popup.
 local function namedUpAlert(name, where)
     if not soundOn then return end
     mq.cmd('/popup ' .. name .. ' IS UP ' .. where)
-    if mq.TLO.Plugin(TTS_PLUGIN).IsLoaded() then
+    if mq.TLO.Plugin(SOUND.ttsPlugin).IsLoaded() then
         mq.cmdf('/tts say "%s is up"', name)
     else
         mq.cmd('/beep'); mq.cmd('/beep')
@@ -1249,7 +1319,7 @@ local function watchPush(kind, text, who)
     if kind ~= "zone" and watchSound then
         local now = mq.gettime()
         if kind == "tell" or now - lastWatchSound > 4000 then
-            playWav(WATCH_WAV)
+            playWav(SOUND.watch)
             lastWatchSound = now
         end
     end
@@ -1260,7 +1330,7 @@ local function listSounds()
     local files = {}
     if okLfs then
         pcall(function()
-            for f in lfs.dir(SOUND_DIR) do
+            for f in lfs.dir(SOUND.dir) do
                 if f:lower():match("%.wav$") then files[#files + 1] = f end
             end
         end)
@@ -1394,8 +1464,12 @@ end
 
 local function onLoot(item, looter, corpse)
     if paused then return end
-    dropLog[#dropLog + 1] = { t = os.date("%H:%M"), item = item, who = looter or "?" }
-    if #dropLog > 100 then table.remove(dropLog, 1) end
+    dropLog[#dropLog + 1] = { t = os.date("%H:%M"), day = os.date("%a %b %d"), item = item, who = looter or "?" }
+    if #dropLog > 500 then table.remove(dropLog, 1) end
+    -- Saved by the main loop within ~10s, not here: the save file is hundreds of KB and a group
+    -- loots several lines a second, so one write per line would be the whole file each time. The
+    -- flag rides on the list itself because the main chunk is 3 locals from Lua's limit of 200.
+    dropLog.unsaved = true
     -- Cash + tribute worth of items YOU loot: the item just landed in your bags, so look it up now.
     if looter == "You" then
         local li = mq.TLO.FindItem("=" .. item)
@@ -1417,7 +1491,7 @@ local function onLoot(item, looter, corpse)
             w.count = w.count + 1
             info(string.format("\ag[DROP]\at %s (looted by %s, total %d)", w.item, looter or "?", w.count))
             if soundOn then mq.cmd('/popup ' .. w.item .. ' dropped') end
-            playWav(LOOT_WAV)
+            playWav(SOUND.loot)
             saveAll()
         end
     end
@@ -1425,16 +1499,23 @@ local function onLoot(item, looter, corpse)
     -- line (cazic includes it); fall back to your target on servers whose line omits it. Match the
     -- corpse name to a named or one of its PHs (PH drops roll up to the parent). If a shared PH
     -- belongs to several camps, you're standing on the corpse - credit the nearest spot.
-    if looter ~= "You" then return end
+    -- A group member's loot counts too (v1.56): a box often loots the camp's drops - in one real
+    -- log 356 of 547 loot lines were a member's, all missing from the drop tables. Their lines
+    -- always name the corpse; YOUR target says nothing about someone else's loot, so a member's
+    -- line with no corpse is skipped. Anyone outside the group is never credited.
+    if looter ~= "You" and not (corpse and mq.TLO.Group.Member(looter)()) then return end
     local src = (corpse and corpse ~= "" and corpse) or mq.TLO.Target.CleanName()
     if not src or src == "" then return end
-    src = src:lower()
+    -- The corpse must BE the named or a PH, not merely contain the name ("Saber" is inside "a
+    -- sabertooth cat"). A targeted corpse reads "X's corpse", so drop that tail; spawn names
+    -- spell an apostrophe as a backtick, so the line's spelling is brought to match.
+    src = src:lower():gsub("[`']s corpse.*$", ""):gsub("'", "`")
     local hits = {}
     for _, e in ipairs(roster) do
-        local hit = src:find(e.name:lower(), 1, true) ~= nil
+        local hit = src == e.name:lower()
         if not hit then
             for _, ph in ipairs(e.ph) do
-                if src:find(ph:lower(), 1, true) then hit = true break end
+                if src == ph:lower() then hit = true break end
             end
         end
         if hit then hits[#hits + 1] = e end
@@ -1580,7 +1661,7 @@ local function bankLoc(e, sp)
     if e.roams then return end   -- roamers wander out of client spawn range -> false respawns bank junk spots; don't
     local y, x, z = sp.Y(), sp.X(), sp.Z()
     if not y or not x or (y == 0 and x == 0 and (z or 0) == 0) then return end
-    local r = e.spotRadius or SPOT_RADIUS_DEFAULT
+    local r = e.spotRadius or TUNE.spotRadius
     for _, L in ipairs(e.locs) do
         if (L.y - y) ^ 2 + (L.x - x) ^ 2 <= r * r then   -- spawned at a spot we already know
             L.n = (L.n or 1) + 1                         -- another confirmed sighting here
@@ -1594,10 +1675,28 @@ local function bankLoc(e, sp)
     end
 end
 
+-- The live spawn of THIS named, or nil. MQ's spawn search matches a name anywhere inside another
+-- ('npc "Saber"' also finds "a sabertooth cat"), and its exact form ('=') is no help on Live: a
+-- named's raw name often starts with '#' ("#Falmonius00"), which MQ's exact compare keeps unless
+-- the user changed an ini setting. So search loosely and accept only an exact clean name. The
+-- nearest hit is nearly always the named itself; the walk down the list only runs when a
+-- look-alike is nearer. NearestSpawn splits "N,search" at the FIRST comma, so a comma inside a
+-- name is safe.
+local function findNamed(name)
+    local search = string.format('npc "%s"', name)
+    local sp = mq.TLO.Spawn(search)
+    if sp() == nil then return nil end
+    if sp.CleanName() == name then return sp end
+    for i = 1, mq.TLO.SpawnCount(search)() or 0 do
+        local s = mq.TLO.NearestSpawn(string.format('%d,%s', i, search))
+        if s.CleanName() == name then return s end
+    end
+    return nil
+end
 
 local function pollByName(e)
-    local sp    = mq.TLO.Spawn(string.format('npc "%s"', e.name))
-    local nowUp = sp() ~= nil and (sp.CleanName() or "") == e.name
+    local sp    = findNamed(e.name)
+    local nowUp = sp ~= nil
     if nowUp then e.upDist = sp.Distance() or 999 end   -- runtime-only: how close were we last time it was up
 
     if not e.seen then
@@ -1615,7 +1714,7 @@ local function pollByName(e)
         elseif e.isUp and not nowUp then
             -- Presence loss is only a KILL if we were close enough to have done it. From across the
             -- zone it's a despawn, someone else's kill, or the mob leaving client spawn range.
-            if (e.upDist or 999) <= KILL_RANGE then
+            if (e.upDist or 999) <= TUNE.killRange then
                 if not e.killTime or os.time() - e.killTime > 30 then
                     recordKill(e, true)
                 end
@@ -1631,11 +1730,11 @@ end
 -- the named is down. NOTE: MQ spawn-search loc is ordered X Y Z (opposite of our stored y,x,z);
 -- radius is required.
 local function pollSpot(e)
-    local r = e.spotRadius or SPOT_RADIUS_DEFAULT
+    local r = e.spotRadius or TUNE.spotRadius
 
     -- Reliable signal: is THIS named (unique name) present anywhere in zone?
-    local sp = mq.TLO.Spawn(string.format('npc "%s"', e.name))
-    local namedUp = sp() ~= nil
+    local sp = findNamed(e.name)
+    local namedUp = sp ~= nil
     if namedUp then e.upDist = sp.Distance() or 999 end   -- runtime-only: how close were we last time it was up
 
     if not e.spotSeen then   -- first pass: adopt current state silently (no load-time alert)
@@ -1663,7 +1762,7 @@ local function pollSpot(e)
         if not e.killTime or os.time() - e.killTime > 30 then
             if sb and sKind == nil then
                 recordKill(e, true, false, sb, "other")       -- stranger: clock yes, credit no
-            elseif sKind or (e.upDist or 999) <= KILL_RANGE then
+            elseif sKind or (e.upDist or 999) <= TUNE.killRange then
                 recordKill(e, true, true, sb, sKind)          -- ours (confirmed or close enough)
             end
         end
@@ -1695,7 +1794,7 @@ local function pollSpot(e)
 
     local prevId = e.spotOccupantId
     if occId == prevId then                   -- same MOB still sitting there: track its dwell time
-        if occId and e.spotSince and not e.spotDwelt and os.time() - e.spotSince >= PH_DWELL then
+        if occId and e.spotSince and not e.spotDwelt and os.time() - e.spotSince >= TUNE.phDwell then
             e.spotDwelt = true                -- settled: a placeholder waits to be killed, a pather doesn't
             local settled, dchanged = e.spotOccupant, false
             -- the repop interval measured when this mob arrived only counts now that it settled
@@ -1709,7 +1808,7 @@ local function pollSpot(e)
             for _, ph in ipairs(e.ph) do if ph == settled then known = true break end end
             if settled and not known then
                 e.phCandidates[settled] = (e.phCandidates[settled] or 0) + 1   -- transient: not saved until it learns
-                if e.phCandidates[settled] >= PH_THRESHOLD then
+                if e.phCandidates[settled] >= TUNE.phThreshold then
                     e.ph[#e.ph + 1] = settled
                     e.phCandidates[settled] = nil
                     dchanged = true
@@ -1731,10 +1830,10 @@ local function pollSpot(e)
         local d2 = (L.x - meX) ^ 2 + (L.y - meY) ^ 2
         if d2 < nearD2 then nearD2 = d2 end
     end
-    if occ == nil and nearD2 > SPOT_TRUST_RANGE * SPOT_TRUST_RANGE then return end   -- unreliable read: no transition
+    if occ == nil and nearD2 > TUNE.trustRange * TUNE.trustRange then return end   -- unreliable read: no transition
 
     -- The occupant CHANGED. Everything below is gated on whether the mob that just left had
-    -- DWELT at the spot (PH_DWELL seconds): a placeholder spawns and waits to be killed, a
+    -- DWELT at the spot (TUNE.phDwell seconds): a placeholder spawns and waits to be killed, a
     -- pather is gone in seconds. Without this, dense zones adopt every passer-by as a PH and
     -- pollute the repop clock + kill tally with them (the Chirid report, v1.43).
     local leftDwelt = e.spotDwelt
@@ -1751,7 +1850,7 @@ local function pollSpot(e)
         -- only a mob that had SETTLED counts as a placeholder kill / a real cycle start
         if leftDwelt then
             e.spotEmptyTime = os.time()
-            if nearD2 <= KILL_RANGE * KILL_RANGE then   -- only OUR camp's clears count as PH kills
+            if nearD2 <= TUNE.killRange * TUNE.killRange then   -- only OUR camp's clears count as PH kills
                 e.phKills = e.phKills + 1     -- count only; a PH kill must NOT touch the named's clock (v0.61)
                 changed = true
             end
@@ -1781,7 +1880,7 @@ local function checkAlerts()
                 e.alerted = true
                 if not e.hidden then
                     info(string.format("\ao%s - spawn window open", e.name))
-                    playWav(WINDOW_WAV)
+                    playWav(SOUND.window)
                 end
             end
         end
@@ -1821,7 +1920,7 @@ local function pollZonePcs()
                 local desc = string.format("%s (%d %s)%s entered the zone", p.name, p.level, p.class,
                     p.guild ~= "" and (" <" .. p.guild .. ">") or "")
                 if watchEcho then warn(">> " .. desc) end   -- ASCII markers: chat has no italics, and
-                playWav(INTRUDER_WAV)                       -- >> / << scan far faster than reading the verb
+                playWav(SOUND.intruder)                       -- >> / << scan far faster than reading the verb
                 watchPush("zone", desc)
             end
         end
@@ -1844,24 +1943,34 @@ end
 -- UI
 
 local minimized  = false
-local filterMode = 0          -- 0 all, 1 up, 2 need
-local showHidden = false
-local lootInput  = ""
-local voiceInput = ""
-local replyInput = ""
-local zonePcsSort = "name"   -- pinned zone-players list sort: "name" (alpha) or "level"
 local selectedName = nil     -- Camps master-detail: which named's detail panel is open (nil = none)
-local sortMode = "due"       -- Camps list sort: "due" (soonest first, folds in Timers) or "name" (alpha)
-
-local addName, addPH, addOverride = "", "", 0
-local editOverride, editPH, editSpotRadius, editRoams = 0, "", 0, false
-local editFor = nil                  -- which named the sidebar's inline edit buffers are loaded for
-local notesBuf, notesDirty = "", false
-local lootSort = "added"             -- Loot Watch sort: "added" | "name" | "count"
-local statsCroakFilter = "all"       -- Stats croak ledger filter: "all" | "out" (outsiders only)
-local lootCountCache, lootCountAt = {}, 0   -- inv/bank counts per watched item, refreshed every 5s
+-- What the user has picked or typed in the window. One table, for the same 200-local reason as TUNE;
+-- only the UI sets and reads these.
+local ui = {
+    filterMode = 0,             -- Camps: 0 all, 1 up, 2 need
+    showHidden = false,
+    sortMode = "due",           -- Camps list sort: "due" (soonest first, folds in Timers) or "name" (alpha)
+    zonePcsSort = "name",       -- pinned zone-players list sort: "name" (alpha) or "level"
+    lootSort = "added",         -- Loot Watch sort: "added" | "name" | "count"
+    statsCroakFilter = "all",   -- Stats croak ledger filter: "all" | "out" (outsiders only)
+    lootInput = "", voiceInput = "", replyInput = "",
+    addName = "", addPH = "", addOverride = 0,   -- the Add named popup
+}
+-- The detail panel's inline edit buffers. forName = which named they are loaded for (nil = none).
+local edit = { override = 0, ph = "", spotRadius = 0, roams = false, forName = nil, notes = "", notesDirty = false }
+local lootCountCache, lootCountAt = {}, 0   -- inv/bank/shared counts per watched item, refreshed every 5s
 local grpObs = {}                    -- registered DanNet observers, keyed "peer|item"
-local grpCountCache = {}             -- per watched item: { have, total, who } - refreshed from the MAIN loop
+local grpCountCache = {}             -- per watched item: { have, total, who, waiting } - refreshed from the MAIN loop
+-- Asking DanNet, ONE request out at a time. A client gets 256 reply tickets for its whole session,
+-- shared by every script on it; past them every request shares one ticket, and two out together
+-- can swap answers. A lone request can't cross with itself, however many tickets are spent.
+--   pending = the one request out { peer, name, q, at }   rest[peer] = when it may be asked again
+--   silent[peer] = when its unanswered stretch began       warned[peer] = console warning sent
+--   onNet = groupmates on DanNet at the last tick          sent = requests sent since CW started
+--   landed = a watch just landed (rebuild the counts)      waiting = a grp row is still being asked
+--   want = a card request waiting its turn (v1.65)          cardWait = an item window opening for a card
+local dnAsk = { pending = nil, rest = {}, silent = {}, warned = {}, onNet = {}, sent = 0, landed = false, waiting = false,
+                want = nil, cardWait = nil }
 
 -- Theme chrome: pushes the ACTIVE theme's color set (names resolved through ImGuiCol so an
 -- unknown/renamed enum entry skips instead of crashing) + the shared style vars.
@@ -1923,130 +2032,218 @@ local function trustBadge(e)
 end
 
 -- Item hover-tooltip: icon + stats for any item we can find in inventory or bank. Icon drawn from
--- MQ's item sheet: A_DragItem texture animation, cell = Item.Icon() - 500 (the iTrack pattern).
--- Items we don't possess get a "no data" line - MQ has no all-items database to ask.
+-- MQ's item sheet: A_DragItem texture animation, cell = Item.Icon() - 500 (EQ numbers its icons from 500).
+-- MQ has no all-items database to ask, so an item nobody here holds shows a SAVED card if its
+-- Loot Watch row has one (v1.65), and otherwise a "no data" line.
 local animItems = mq.FindTextureAnimation("A_DragItem")
 local EQ_ICON_OFFSET = 500
 local ITEM_SIZES = { [0] = "Tiny", [1] = "Small", [2] = "Medium", [3] = "Large", [4] = "Giant" }
 
+-- One item's card as plain data: what the hover shows, with empty lines left out so a saved card
+-- stays small. Built from any item MQ can read - your own copy, or an item window CroakWatch opened.
+local function cardFromItem(it)
+    local function nz(v) if v ~= nil and v ~= 0 and v ~= "" then return v end end
+    local function names(n, nameOf)
+        if n == 16 then return "All" end
+        if n > 0 then
+            local t = {}
+            for i = 1, n do t[#t + 1] = nameOf(i) end
+            return table.concat(t, " ")
+        end
+    end
+    local c = {
+        name = it.Name(), icon = nz(it.Icon()), id = nz(it.ID()),
+        lore = it.Lore() or nil, nodrop = it.NoDrop() or nil,
+        slots = nz(it.Container()), dmg = nz(it.Damage()), dly = nz(it.ItemDelay()),
+        wt = nz(it.Weight()), value = nz(it.Value()), tribute = nz(it.Tribute()),
+        stack = (it.StackSize() or 0) > 1 and it.StackSize() or nil,
+        classes = names(it.Classes() or 0, function(i) return it.Class(i).ShortName() or "?" end),
+        races = names(it.Races() or 0, function(i) return (it.Race(i).Name() or "?"):sub(1, 3):upper() end),
+        ac = nz(it.AC()), hp = nz(it.HP()), mana = nz(it.Mana()),
+        atk = nz(it.Attack()), haste = nz(it.Haste()), hpRegen = nz(it.HPRegen()), manaRegen = nz(it.ManaRegen()),
+        clicky = nz(it.Clicky()), charges = nz(it.Charges()), proc = nz(it.Proc()), worn = nz(it.Worn()),
+        focus = nz(it.Focus()), rec = nz(it.RecommendedLevel()), req = nz(it.RequiredLevel()),
+        kind = nz(it.Type()), size = it.Size(), stats = {}, resists = {},
+    }
+    if c.slots then c.cap = it.SizeCapacity() end   -- 0 is a real size (Tiny), so not nz()
+    for _, s in ipairs({
+        { "STR", it.STR(), it.HeroicSTR() }, { "STA", it.STA(), it.HeroicSTA() },
+        { "AGI", it.AGI(), it.HeroicAGI() }, { "DEX", it.DEX(), it.HeroicDEX() },
+        { "WIS", it.WIS(), it.HeroicWIS() }, { "INT", it.INT(), it.HeroicINT() },
+        { "CHA", it.CHA(), it.HeroicCHA() },
+    }) do
+        local v, h = s[2] or 0, s[3] or 0
+        if v ~= 0 or h ~= 0 then c.stats[#c.stats + 1] = { s[1], v, h } end
+    end
+    for _, s in ipairs({
+        { "SV Magic", it.svMagic() }, { "Fire", it.svFire() }, { "Cold", it.svCold() },
+        { "Disease", it.svDisease() }, { "Poison", it.svPoison() }, { "Corrupt", it.svCorruption() },
+    }) do
+        if (s[2] or 0) ~= 0 then c.resists[#c.resists + 1] = { s[1], s[2] } end
+    end
+    return c
+end
+
+-- Draws a card. `owned` = how many YOU hold, for a live card of a stackable item; a saved card
+-- shows the stack size instead.
+local function drawCard(c, owned)
+    if c.icon then
+        animItems:SetTextureCell(c.icon - EQ_ICON_OFFSET)
+        imgui.DrawTextureAnimation(animItems, 34, 34)
+        imgui.SameLine()
+    end
+    imgui.TextColored(0.90, 0.76, 0.36, 1, c.name or "?")
+    -- EQ item-window ordering: flags under the name, type/weight, weapon line, AC/HP/Mana,
+    -- stats with heroics inline (STR +25 (+5h)), atk/regen, resists, effects, rec/req last.
+    local function line(parts) if #parts > 0 then imgui.TextDisabled(table.concat(parts, "  ")) end end
+    local p = {}
+    local function add(label, v)
+        v = v or 0
+        if v ~= 0 then p[#p + 1] = string.format("%s %d", label, v) end
+    end
+    local flags = {}
+    if c.lore then flags[#flags + 1] = "LORE ITEM" end
+    if c.nodrop then flags[#flags + 1] = "NO TRADE" end
+    if #flags > 0 then imgui.TextColored(0.90, 0.55, 0.45, 1, table.concat(flags, "   ")) end
+    -- identity block, prominence-ordered: what it IS (container/weapon traits) -> the practical
+    -- (wt/qty/value) -> who can use it -> type/size/ID demoted to the bottom line.
+    if c.slots then   -- containers lead with their defining trait
+        local cap = ITEM_SIZES[c.cap or -1]
+        imgui.TextColored(0.45, 0.85, 0.85, 1, string.format("Container: %d slots%s", c.slots, cap and ("  holds " .. cap) or ""))
+    end
+    if c.dmg then imgui.TextDisabled(string.format("Dmg %d / Dly %d", c.dmg, c.dly or 0)) end
+    if c.wt then p[#p + 1] = string.format("Wt %.1f", c.wt / 10) end
+    if c.stack then p[#p + 1] = owned and string.format("Qty %d / %d", owned, c.stack) or string.format("Stacks to %d", c.stack) end
+    if c.value then
+        local coins = {}
+        local pp, gg, ss, cc = math.floor(c.value / 1000), math.floor(c.value / 100) % 10, math.floor(c.value / 10) % 10, c.value % 10
+        if pp > 0 then coins[#coins + 1] = pp .. "p" end
+        if gg > 0 then coins[#coins + 1] = gg .. "g" end
+        if ss > 0 then coins[#coins + 1] = ss .. "s" end
+        if cc > 0 then coins[#coins + 1] = cc .. "c" end
+        p[#p + 1] = "Value " .. table.concat(coins, " ")
+    end
+    add("Tribute", c.tribute)
+    line(p); p = {}
+    if c.classes then p[#p + 1] = "Classes: " .. c.classes end
+    if c.races then p[#p + 1] = "Races: " .. c.races end
+    line(p); p = {}
+    add("AC", c.ac); add("HP", c.hp); add("Mana", c.mana)
+    line(p); p = {}
+    for _, s in ipairs(c.stats or {}) do
+        p[#p + 1] = string.format("%s %+d%s", s[1], s[2], s[3] > 0 and string.format(" (+%dh)", s[3]) or "")
+    end
+    line(p); p = {}
+    add("Atk", c.atk); add("Haste", c.haste)
+    add("HP Regen", c.hpRegen); add("Mana Regen", c.manaRegen)
+    line(p); p = {}
+    for _, s in ipairs(c.resists or {}) do add(s[1], s[2]) end
+    line(p); p = {}
+    if c.clicky then
+        imgui.TextColored(0.55, 0.85, 1.0, 1, "Clicky: " .. c.clicky .. ((c.charges or 0) > 0 and string.format(" (%d charges)", c.charges) or ""))
+    end
+    if c.proc  then imgui.TextColored(0.55, 0.85, 1.0, 1, "Proc: "  .. c.proc)  end
+    if c.worn  then imgui.TextColored(0.55, 0.85, 1.0, 1, "Worn: "  .. c.worn)  end
+    if c.focus then imgui.TextColored(0.55, 0.85, 1.0, 1, "Focus: " .. c.focus) end
+    add("Rec", c.rec); add("Req", c.req)
+    if c.kind then p[#p + 1] = c.kind end
+    local sz = ITEM_SIZES[c.size or -1]
+    if sz then p[#p + 1] = sz end
+    add("ID", c.id)   -- demoted: least useful in-game, still there for lookups
+    line(p)
+end
+
+-- Who in the group holds a watched item, read from the grp counts (free - nothing is asked).
+-- The first entry of `who` is always you, so it is skipped.
+local function cardHolders(w)
+    local out, g = {}, grpCountCache[w.item]
+    if g then
+        for i = 2, #g.who do
+            local p = g.who[i]
+            if p.inv and p.inv + (p.bank or 0) > 0 then out[#out + 1] = p end
+        end
+    end
+    return out
+end
+
+-- Is a card for this watch already on its way (queued, asked, or its window opening)?
+local function cardBusy(w)
+    if not w then return false end   -- a count watch's pending.cardFor is nil too: never compare nil to nil
+    return (dnAsk.want and dnAsk.want.w == w) or (dnAsk.pending and dnAsk.pending.cardFor == w)
+        or (dnAsk.cardWait and dnAsk.cardWait.w == w) or false
+end
+
+-- Ctrl+Right-Click on a watched item that only a groupmate holds: ask ONE holder for its link.
+-- The request waits its turn in the DanNet asker (askGroupCounts), so it is never out at the same
+-- time as a count watch. A copy in someone's bags is asked for before a copy in a bank.
+local function requestCard(w)
+    if cardBusy(w) then info(string.format("already fetching the \ag%s\at card.", watchBare(w.item))); return end
+    local holders = cardHolders(w)
+    if #holders == 0 then
+        info(string.format("nobody in your group holds \ag%s\at right now - no card to fetch.", watchBare(w.item)))
+        return
+    end
+    local h = holders[1]
+    for _, p in ipairs(holders) do if p.inv > 0 then h = p; break end end
+    local where = h.inv > 0 and "FindItem" or "FindItemBank"
+    dnAsk.want = { peer = h.name:lower(), name = h.name, w = w,
+                   q = string.format("%s[%s].ItemLink[CLICKABLE]", where, itemQuery(w.item)) }
+    info(string.format("asking \ag%s\at for the \ag%s\at item link...", h.name, watchBare(w.item)))
+end
+
 -- `exactName` = the caller knows this is a real full item name (a drop line, a loot tally key),
--- so look it up exactly regardless of quoting. Watch-list rows pass their entry as typed.
-local function itemTooltip(name, exactName)
+-- so look it up exactly regardless of quoting. Watch-list rows pass their entry as typed, plus the
+-- row itself (`w`), which is what keeps a saved card (Loot Watch items only - AL, 2026-11-13).
+local function itemTooltip(name, exactName, w)
     if not imgui.IsItemHovered() then return end
     local q = exactName and ('=' .. name) or itemQuery(name)
     local it = mq.TLO.FindItem(q)
     if it() == nil then it = mq.TLO.FindItemBank(q) end
-    -- Ctrl+Right-Click the hovered name -> open the REAL EQ item display via the item link
-    -- (BigBag pattern: ItemLink('CLICKABLE') + /executelink). The full sheet, drawn by the game.
-    if it() ~= nil and imgui.IsKeyDown(ImGuiMod.Ctrl) and imgui.IsItemClicked(ImGuiMouseButton.Right) then
-        local link = it.ItemLink('CLICKABLE')()
-        if link then mq.cmdf('/executelink %s', link) end
+    local held = it() ~= nil
+    local card = held and cardFromItem(it) or (w and w.card)
+    -- A watched item you hold saves its card once, so the card still shows after your copy is
+    -- gone. The write waits for the main loop's batched save (the flag rides on dropLog).
+    if held and w and not w.card then
+        card.link, card.from, card.day = it.ItemLink('CLICKABLE')(), "you", os.date("%b %d")
+        w.card = card
+        dropLog.unsaved = true
+    end
+    -- Ctrl+Right-Click the hovered name -> open the REAL EQ item window from the item's link
+    -- (ItemLink('CLICKABLE') + /executelink): the full sheet, drawn by the game. Your own copy
+    -- first, then a saved card's link; a watched item only a groupmate holds asks that box for it.
+    if imgui.IsKeyDown(ImGuiMod.Ctrl) and imgui.IsItemClicked(ImGuiMouseButton.Right) then
+        local link = held and it.ItemLink('CLICKABLE')() or (card and card.link)
+        if link then mq.cmdf('/executelink %s', link)
+        elseif w then requestCard(w) end
     end
     imgui.BeginTooltip()
-    if it() ~= nil then
-        local icon = it.Icon() or 0
-        if icon > 0 then
-            animItems:SetTextureCell(icon - EQ_ICON_OFFSET)
-            imgui.DrawTextureAnimation(animItems, 34, 34)
-            imgui.SameLine()
+    if card then
+        local owned = nil
+        if held and card.stack then
+            local exact = '=' .. card.name   -- resolved full name: count this item only
+            owned = (mq.TLO.FindItemCount(exact)() or 0) + (mq.TLO.FindItemBankCount(exact)() or 0)
         end
-        imgui.TextColored(0.90, 0.76, 0.36, 1, it.Name() or name)
-        -- EQ item-window ordering: flags under the name, type/weight, weapon line, AC/HP/Mana,
-        -- stats with heroics inline (STR +25 (+5h)), atk/regen, resists, effects, rec/req last.
-        local function line(parts) if #parts > 0 then imgui.TextDisabled(table.concat(parts, "  ")) end end
-        local p = {}
-        local function add(label, v)
-            v = v or 0
-            if v ~= 0 then p[#p + 1] = string.format("%s %d", label, v) end
-        end
-        local flags = {}
-        if it.Lore() then flags[#flags + 1] = "LORE ITEM" end
-        if it.NoDrop() then flags[#flags + 1] = "NO TRADE" end
-        if #flags > 0 then imgui.TextColored(0.90, 0.55, 0.45, 1, table.concat(flags, "   ")) end
-        -- identity block, prominence-ordered: what it IS (container/weapon traits) -> the practical
-        -- (wt/qty/value) -> who can use it -> type/size/ID demoted to the bottom line.
-        local slots = it.Container() or 0
-        if slots > 0 then   -- containers lead with their defining trait
-            local cap = ITEM_SIZES[it.SizeCapacity() or -1]
-            imgui.TextColored(0.45, 0.85, 0.85, 1, string.format("Container: %d slots%s", slots, cap and ("  holds " .. cap) or ""))
-        end
-        if (it.Damage() or 0) > 0 then imgui.TextDisabled(string.format("Dmg %d / Dly %d", it.Damage(), it.ItemDelay() or 0)) end
-        local wt = it.Weight() or 0
-        if wt > 0 then p[#p + 1] = string.format("Wt %.1f", wt / 10) end
-        local maxStack = it.StackSize() or 0
-        if maxStack > 1 then
-            local exact = '=' .. (it.Name() or name)   -- resolved full name: count this item only
-            local owned = (mq.TLO.FindItemCount(exact)() or 0) + (mq.TLO.FindItemBankCount(exact)() or 0)
-            p[#p + 1] = string.format("Qty %d / %d", owned, maxStack)
-        end
-        local val = it.Value() or 0
-        if val > 0 then
-            local coins = {}
-            local pp, gg, ss, cc = math.floor(val / 1000), math.floor(val / 100) % 10, math.floor(val / 10) % 10, val % 10
-            if pp > 0 then coins[#coins + 1] = pp .. "p" end
-            if gg > 0 then coins[#coins + 1] = gg .. "g" end
-            if ss > 0 then coins[#coins + 1] = ss .. "s" end
-            if cc > 0 then coins[#coins + 1] = cc .. "c" end
-            p[#p + 1] = "Value " .. table.concat(coins, " ")
-        end
-        add("Tribute", it.Tribute())
-        line(p); p = {}
-        local nc = it.Classes() or 0
-        if nc == 16 then p[#p + 1] = "Classes: All"
-        elseif nc > 0 then
-            local t = {}
-            for i = 1, nc do t[#t + 1] = it.Class(i).ShortName() or "?" end
-            p[#p + 1] = "Classes: " .. table.concat(t, " ")
-        end
-        local nr = it.Races() or 0
-        if nr == 16 then p[#p + 1] = "Races: All"
-        elseif nr > 0 then
-            local t = {}
-            for i = 1, nr do t[#t + 1] = (it.Race(i).Name() or "?"):sub(1, 3):upper() end
-            p[#p + 1] = "Races: " .. table.concat(t, " ")
-        end
-        line(p); p = {}
-        add("AC", it.AC()); add("HP", it.HP()); add("Mana", it.Mana())
-        line(p); p = {}
-        local stats = {
-            { "STR", it.STR(), it.HeroicSTR() }, { "STA", it.STA(), it.HeroicSTA() },
-            { "AGI", it.AGI(), it.HeroicAGI() }, { "DEX", it.DEX(), it.HeroicDEX() },
-            { "WIS", it.WIS(), it.HeroicWIS() }, { "INT", it.INT(), it.HeroicINT() },
-            { "CHA", it.CHA(), it.HeroicCHA() },
-        }
-        for _, s in ipairs(stats) do
-            local v, h = s[2] or 0, s[3] or 0
-            if v ~= 0 or h ~= 0 then
-                p[#p + 1] = string.format("%s %+d%s", s[1], v, h > 0 and string.format(" (+%dh)", h) or "")
-            end
-        end
-        line(p); p = {}
-        add("Atk", it.Attack()); add("Haste", it.Haste())
-        add("HP Regen", it.HPRegen()); add("Mana Regen", it.ManaRegen())
-        line(p); p = {}
-        add("SV Magic", it.svMagic()); add("Fire", it.svFire()); add("Cold", it.svCold())
-        add("Disease", it.svDisease()); add("Poison", it.svPoison()); add("Corrupt", it.svCorruption())
-        line(p); p = {}
-        local clicky, proc, worn, focus = it.Clicky(), it.Proc(), it.Worn(), it.Focus()
-        if clicky and clicky ~= "" then
-            local ch = it.Charges() or 0
-            imgui.TextColored(0.55, 0.85, 1.0, 1, "Clicky: " .. clicky .. (ch > 0 and string.format(" (%d charges)", ch) or ""))
-        end
-        if proc  and proc  ~= "" then imgui.TextColored(0.55, 0.85, 1.0, 1, "Proc: "  .. proc)  end
-        if worn  and worn  ~= "" then imgui.TextColored(0.55, 0.85, 1.0, 1, "Worn: "  .. worn)  end
-        if focus and focus ~= "" then imgui.TextColored(0.55, 0.85, 1.0, 1, "Focus: " .. focus) end
-        add("Rec", it.RecommendedLevel()); add("Req", it.RequiredLevel())
-        local typ = it.Type() or ""
-        if typ ~= "" then p[#p + 1] = typ end
-        local sz = ITEM_SIZES[it.Size() or -1]
-        if sz then p[#p + 1] = sz end
-        add("ID", it.ID())   -- demoted: least useful in-game, still there for lookups
-        line(p)
+        drawCard(card, owned)
         imgui.Separator()
+        if not held then
+            imgui.TextColored(0.45, 0.85, 0.85, 1, string.format("saved card - from %s, %s",
+                card.from == "you" and "your own copy" or (card.from or "?") .. "'s copy", card.day or "?"))
+            imgui.TextDisabled("you don't hold one now: Loot Watch kept this card\nfrom the last copy CroakWatch read")
+        end
         imgui.TextDisabled("Ctrl+Right-Click: open the real item window")
     else
         imgui.Text(name)
-        imgui.TextDisabled("not in your inventory or bank - no item data to show")
+        local holders = w and cardHolders(w) or {}
+        if cardBusy(w) then
+            imgui.TextColored(0.45, 0.85, 0.85, 1, "fetching its card from a groupmate...")
+        elseif #holders > 0 then
+            local names = {}
+            for _, p in ipairs(holders) do names[#names + 1] = p.name end
+            imgui.TextColored(0.3, 1.0, 0.3, 1, "held by " .. table.concat(names, ", "))
+            imgui.TextDisabled("Ctrl+Right-Click: open the real item window from their\ncopy - CroakWatch then saves its card for next time")
+        else
+            imgui.TextDisabled("not in your inventory or bank - no item data to show")
+        end
     end
     imgui.EndTooltip()
 end
@@ -2168,8 +2365,8 @@ local function renderDetail(e)
 
     gold(e.name)
     if imgui.IsItemClicked() then   -- target the LIVE npc by id (npc filter skips corpses, which share the name)
-        local sp = mq.TLO.Spawn(string.format('npc "%s"', e.name))
-        if (sp.ID() or 0) > 0 then mq.cmdf('/target id %d', sp.ID()) end
+        local sp = findNamed(e.name)
+        if sp then mq.cmdf('/target id %d', sp.ID()) end
     end
     if imgui.IsItemHovered() then imgui.SetTooltip("click to target " .. e.name .. " (when up)") end
     if e.isUp then imgui.SameLine(); imgui.TextColored(0.3, 1.0, 0.3, 1, " [UP]") end
@@ -2230,13 +2427,13 @@ local function renderDetail(e)
     end
 
     -- Load the inline Spawn Settings buffers when the selection changes
-    if editFor ~= e.name then
-        editFor        = e.name
-        editOverride   = e.override and math.floor(e.override / 60) or 0
-        editPH         = joinCSV(e.ph)
-        editSpotRadius = e.spotRadius or SPOT_RADIUS_DEFAULT
-        editRoams      = e.roams or false
-        notesBuf, notesDirty = e.notes or "", false
+    if edit.forName ~= e.name then
+        edit.forName    = e.name
+        edit.override   = e.override and math.floor(e.override / 60) or 0
+        edit.ph         = joinCSV(e.ph)
+        edit.spotRadius = e.spotRadius or TUNE.spotRadius
+        edit.roams      = e.roams or false
+        edit.notes, edit.notesDirty = e.notes or "", false
     end
 
     if imgui.SmallButton("Reset") then
@@ -2258,8 +2455,8 @@ local function renderDetail(e)
     if e.isUp or #e.locs > 0 then
         imgui.SameLine()
         if imgui.SmallButton("Nav") then
-            local sp = mq.TLO.Spawn(string.format('npc "%s"', e.name))
-            if (sp.ID() or 0) > 0 then
+            local sp = findNamed(e.name)
+            if sp then
                 mq.cmdf('/nav id %d', sp.ID())   -- up: nav to the LIVE mob (uses FloorHeight - mesh-safe, unlike a raw stored Z)
                 info(string.format("Nav to \ag%s\at - live mob (nav id)", e.name))
             elseif #e.locs > 0 then
@@ -2281,13 +2478,13 @@ local function renderDetail(e)
     imgui.SeparatorText("Notes")
     -- MQ's binding is (label, text, sizeX, sizeY, flags) - v0.77 accidentally passed 56 as FLAGS,
     -- which in ImGui 1.92's renumbered enum = CharsUppercase|CharsNoBlank -> forced ALL CAPS notes.
-    local txt = imgui.InputTextMultiline("##notes", notesBuf, -1, 56)
+    local txt = imgui.InputTextMultiline("##notes", edit.notes, -1, 56)
     -- Accept a change ONLY while the field is focused (a real keystroke). A spurious different
     -- return while unfocused could otherwise mark dirty and overwrite the saved note.
-    if txt ~= notesBuf and imgui.IsItemActive() then notesBuf = txt; notesDirty = true end
-    if notesDirty and not imgui.IsItemActive() then   -- save once when the field loses focus
-        e.notes = notesBuf ~= "" and notesBuf or nil
-        notesDirty = false
+    if txt ~= edit.notes and imgui.IsItemActive() then edit.notes = txt; edit.notesDirty = true end
+    if edit.notesDirty and not imgui.IsItemActive() then   -- save once when the field loses focus
+        e.notes = edit.notes ~= "" and edit.notes or nil
+        edit.notesDirty = false
         saveAll()
     end
 
@@ -2320,27 +2517,27 @@ local function renderDetail(e)
 
     imgui.SeparatorText("Spawn Settings")
     imgui.SetNextItemWidth(100)
-    editOverride = imgui.InputInt("Override min", editOverride)
-    if editOverride < 0 then editOverride = 0 end
+    edit.override = imgui.InputInt("Override min", edit.override)
+    if edit.override < 0 then edit.override = 0 end
     if imgui.IsItemHovered() then imgui.SetTooltip("manual respawn override in minutes (0 = learn automatically)") end
     imgui.SetNextItemWidth(130)
-    editPH = imgui.InputText("PH", editPH, 256)
+    edit.ph = imgui.InputText("PH", edit.ph, 256)
     if imgui.IsItemHovered() then imgui.SetTooltip("placeholder names, comma separated") end
     imgui.SameLine()
     if imgui.SmallButton("Target##ep") then
         local t = mq.TLO.Target.CleanName()
-        if t then editPH = editPH == "" and t or (editPH .. ", " .. t) end
+        if t then edit.ph = edit.ph == "" and t or (edit.ph .. ", " .. t) end
     end
     imgui.SetNextItemWidth(100)
-    editSpotRadius = imgui.InputInt("Spot radius", editSpotRadius)
-    if editSpotRadius < 0 then editSpotRadius = 0 end
-    editRoams = imgui.Checkbox("Roams", editRoams)
+    edit.spotRadius = imgui.InputInt("Spot radius", edit.spotRadius)
+    if edit.spotRadius < 0 then edit.spotRadius = 0 end
+    edit.roams = imgui.Checkbox("Roams", edit.roams)
     if imgui.IsItemHovered() then imgui.SetTooltip("roamer: name-poll only, no spot tracking (clears banked spots)") end
     if imgui.SmallButton("Save##edit") then
-        e.override   = editOverride > 0 and editOverride * 60 or nil
-        e.ph         = splitCSV(editPH)
-        e.spotRadius = (editSpotRadius > 0 and editSpotRadius ~= SPOT_RADIUS_DEFAULT) and editSpotRadius or nil
-        e.roams      = editRoams or nil
+        e.override   = edit.override > 0 and edit.override * 60 or nil
+        e.ph         = splitCSV(edit.ph)
+        e.spotRadius = (edit.spotRadius > 0 and edit.spotRadius ~= TUNE.spotRadius) and edit.spotRadius or nil
+        e.roams      = edit.roams or nil
         if e.roams then e.locs = {} end   -- a roamer's banked spots are junk - clear them when flagged
         saveAll()
     end
@@ -2349,7 +2546,7 @@ local function renderDetail(e)
     imgui.PushStyleColor(ImGuiCol.ButtonHovered, 0.65, 0.18, 0.18, 1)
     if imgui.SmallButton("Remove##edit") then
         db[dbKey(e.zone, e.name)] = nil
-        selectedName, editFor = nil, nil
+        selectedName, edit.forName = nil, nil
         saveAll(); rosterRebuild()
     end
     imgui.PopStyleColor(2)
@@ -2359,6 +2556,7 @@ local function renderDetail(e)
     end
 
     imgui.SeparatorText("Loot")
+    if imgui.IsItemHovered() then imgui.SetTooltip("what this named and its PHs dropped, looted by you or anyone in your group\nX removes a line that should not be here") end
     local items = {}
     for it, cnt in pairs(e.loot) do items[#items + 1] = { it = it, cnt = cnt } end
     table.sort(items, function(a, b) return a.cnt > b.cnt end)
@@ -2382,27 +2580,27 @@ local function renderAddPopup()
     if imgui.BeginPopup("addnamed") then
         gold("Add Named")
         imgui.Separator()
-        addName = imgui.InputText("Named", addName, 128)
+        ui.addName = imgui.InputText("Named", ui.addName, 128)
         imgui.SameLine()
-        if imgui.SmallButton("Target##an") then addName = mq.TLO.Target.CleanName() or addName end
-        addPH = imgui.InputText("PH (comma sep)", addPH, 256)
+        if imgui.SmallButton("Target##an") then ui.addName = mq.TLO.Target.CleanName() or ui.addName end
+        ui.addPH = imgui.InputText("PH (comma sep)", ui.addPH, 256)
         imgui.SameLine()
         if imgui.SmallButton("Target##ap") then
             local t = mq.TLO.Target.CleanName()
-            if t then addPH = addPH == "" and t or (addPH .. ", " .. t) end
+            if t then ui.addPH = ui.addPH == "" and t or (ui.addPH .. ", " .. t) end
         end
-        addOverride = imgui.InputInt("Override min (0=auto)", addOverride)
-        if addOverride < 0 then addOverride = 0 end
-        if imgui.Button("Add##do") and addName ~= "" then
-            local nm  = spawnName(addName)
+        ui.addOverride = imgui.InputInt("Override min (0=auto)", ui.addOverride)
+        if ui.addOverride < 0 then ui.addOverride = 0 end
+        if imgui.Button("Add##do") and ui.addName ~= "" then
+            local nm  = spawnName(ui.addName)
             local key = dbKey(curZoneShort, nm)
             if not db[key] then
-                local e = newEntry(nm, addName, curZoneShort, true)
-                e.ph       = splitCSV(addPH)
-                e.override = addOverride > 0 and addOverride * 60 or nil
+                local e = newEntry(nm, ui.addName, curZoneShort, true)
+                e.ph       = splitCSV(ui.addPH)
+                e.override = ui.addOverride > 0 and ui.addOverride * 60 or nil
                 db[key] = e
             end
-            addName, addPH, addOverride = "", "", 0
+            ui.addName, ui.addPH, ui.addOverride = "", "", 0
             saveAll(); rosterRebuild()
             imgui.CloseCurrentPopup()
         end
@@ -2618,48 +2816,212 @@ local function dropGroupObservers(item)
     end
 end
 
+-- Builds the grp N/M column from what DanNet already holds. Free local reads only - this never
+-- asks a box anything (askGroupCounts does that). A box is counted once BOTH of its counts are in:
+-- an inventory-only number would be wrong, so until then the row is marked as still waiting.
 local function refreshGroupCounts()
-    grpCountCache = {}
+    grpCountCache, dnAsk.landed, dnAsk.waiting = {}, false, false
     if not mq.TLO.Plugin('MQ2DanNet').IsLoaded() then return end
     local nMembers = mq.TLO.Group.Members() or 0
     if nMembers == 0 or #lootWatch == 0 then return end
     for _, w in ipairs(lootWatch) do
         local q  = itemQuery(w.item)   -- same string for us and the peers: everyone counts alike
         local qi = string.format("FindItemCount[%s]", q)
-        local qb = string.format("FindItemBankCount[%s]", q)   -- bank too (iTrack parity)
+        local qb = string.format("FindItemBankCount[%s]", q)   -- bank too: a copy put away still counts
         local selfInv  = mq.TLO.FindItemCount(q)() or 0
         local selfBank = mq.TLO.FindItemBankCount(q)() or 0
-        local have, total = (selfInv + selfBank) > 0 and 1 or 0, 1
+        local have, total, waiting = (selfInv + selfBank) > 0 and 1 or 0, 1, false
         local who = { { name = mq.TLO.Me.CleanName() or "me", inv = selfInv, bank = selfBank } }
         for i = 1, nMembers do
             local m  = mq.TLO.Group.Member(i)
             local nm = m.Name()
             if nm and not m.Mercenary() then   -- GroupMember data works out-of-zone too (spawn TLOs don't)
                 local peer = nm:lower()
-                -- Trust ObserveSet, not our own bookkeeping: a /dobserve sent before the peer was
-                -- visible to DanNet silently no-ops. Re-issue every refresh until the observer sticks.
-                if mq.TLO.DanNet(peer).ObserveSet(qi)() then
-                    grpObs[peer .. "|" .. w.item] = true   -- confirmed active (item removal drops it)
-                    local rec = tonumber(mq.TLO.DanNet(peer).OReceived(qi)() or 0) or 0
-                    if rec > 0 then
-                        local inv  = tonumber(mq.TLO.DanNet(peer).O(qi)()) or 0
-                        local bank = mq.TLO.DanNet(peer).ObserveSet(qb)() and (tonumber(mq.TLO.DanNet(peer).O(qb)()) or 0) or 0
-                        total = total + 1
-                        if inv + bank > 0 then have = have + 1 end
-                        who[#who + 1] = { name = nm, inv = inv, bank = bank }
-                    else
-                        who[#who + 1] = { name = nm, inv = -1 }   -- observer set, first value still in flight
-                    end
+                -- mq.TLO.DanNet(peer) is built afresh for every read: DanNet keeps the peer for ONE read
+                local setI, setB = mq.TLO.DanNet(peer).ObserveSet(qi)(), mq.TLO.DanNet(peer).ObserveSet(qb)()
+                if setI or setB then grpObs[peer .. "|" .. w.item] = true end   -- item removal drops it
+                if not dnAsk.onNet[peer] then
+                    who[#who + 1] = { name = nm, state = "off" }   -- not on DanNet: nothing to ask, not counted
+                elseif setI and setB and (tonumber(mq.TLO.DanNet(peer).OReceived(qi)() or 0) or 0) > 0
+                        and (tonumber(mq.TLO.DanNet(peer).OReceived(qb)() or 0) or 0) > 0 then
+                    local inv  = tonumber(mq.TLO.DanNet(peer).O(qi)()) or 0
+                    local bank = tonumber(mq.TLO.DanNet(peer).O(qb)()) or 0
+                    total = total + 1
+                    if inv + bank > 0 then have = have + 1 end
+                    who[#who + 1] = { name = nm, inv = inv, bank = bank }
                 else
-                    mq.cmdf('/squelch /dobserve %s -q "%s"', peer, qi)   -- (re)register - idempotent, retries every ~10s
-                    who[#who + 1] = { name = nm, inv = -1 }
-                end
-                if not mq.TLO.DanNet(peer).ObserveSet(qb)() then
-                    mq.cmdf('/squelch /dobserve %s -q "%s"', peer, qb)
+                    total, waiting = total + 1, true   -- on DanNet, an answer still to come
+                    who[#who + 1] = { name = nm, state = dnAsk.warned[peer] and "silent" or "asking" }
                 end
             end
         end
-        grpCountCache[w.item] = { have = have, total = total, who = who }
+        if waiting then dnAsk.waiting = true end
+        grpCountCache[w.item] = { have = have, total = total, who = who, waiting = waiting }
+    end
+end
+
+-- The next watch to ask for, in list order: each item's inventory count then its bank count, box
+-- by box. Skips boxes not on DanNet (DanNet would refuse) and boxes resting after a silence.
+local function nextMissingWatch(now)
+    local nMembers = mq.TLO.Group.Members() or 0
+    for _, w in ipairs(lootWatch) do
+        local q = itemQuery(w.item)
+        for i = 1, nMembers do
+            local m  = mq.TLO.Group.Member(i)
+            local nm = m.Name()
+            if nm and not m.Mercenary() then
+                local peer = nm:lower()
+                if dnAsk.onNet[peer] and (dnAsk.rest[peer] or 0) <= now then
+                    for _, f in ipairs({ "FindItemCount[%s]", "FindItemBankCount[%s]" }) do
+                        local qq = string.format(f, q)
+                        if not mq.TLO.DanNet(peer).ObserveSet(qq)() then return peer, qq, w.item, nm end
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- Has the one request out been answered? A count watch has landed once DanNet holds it. A card
+-- request also needs its first value - the item link - which comes back in the same reply.
+local function dnLanded(req)
+    if not mq.TLO.DanNet(req.peer).ObserveSet(req.q)() then return false end
+    return not req.cardFor or (tonumber(mq.TLO.DanNet(req.peer).OReceived(req.q)() or 0) or 0) > 0
+end
+
+-- The one request out was answered. A count watch only needs the counts rebuilt. A card request
+-- was a one-time question: read the link, forget the watch again (free, nothing is sent), and
+-- open the link, which opens the item window on THIS character for readCardWindow to read.
+-- It is a /dobserve rather than a /dquery on purpose: /dquery also starts a macro-style /delay,
+-- which would pause any .mac macro running on this character until the answer came back.
+local function dnAnswered(req)
+    dnAsk.pending, dnAsk.silent[req.peer], dnAsk.warned[req.peer] = nil, nil, nil
+    if not req.cardFor then dnAsk.landed = true; return end
+    local link = mq.TLO.DanNet(req.peer).O(req.q)()
+    mq.cmdf('/squelch /dobserve %s -q "%s" -drop', req.peer, req.q)
+    local parsed = type(link) == "string" and mq.ParseItemLink(link) or nil
+    if not parsed or (parsed.itemID or 0) == 0 then
+        warn(string.format("\ag%s\at doesn't hold \ag%s\at any more - no card to fetch.", req.name, watchBare(req.cardFor.item)))
+        return
+    end
+    mq.cmdf('/executelink %s', link)
+    dnAsk.cardWait = { w = req.cardFor, id = parsed.itemID, link = link, from = req.name, at = mq.gettime() }
+end
+
+-- What to ask next: a card someone is waiting for goes first, then the next missing count watch.
+local function nextRequest(now)
+    local want = dnAsk.want
+    if want then
+        dnAsk.want = nil
+        if dnAsk.onNet[want.peer] then return want.peer, want.q, nil, want.name, want.w end
+        warn(string.format("\ag%s\at isn't on DanNet now - no card to fetch.", want.name))
+    end
+    return nextMissingWatch(now)
+end
+
+-- Asks the group for any watch DanNet doesn't hold yet, with never more than ONE request out.
+-- Runs on the main loop. A watch is asked for only when it is MISSING, never again on a timer:
+-- one DanNet already holds keeps updating by itself whenever that box's count changes.
+-- A card request (v1.65) shares the same one slot, and goes ahead of the count watches.
+local function askGroupCounts()
+    if not mq.TLO.Plugin('MQ2DanNet').IsLoaded() then return end
+    local now = mq.gettime()
+    -- Which peers are on DanNet: a free local read. A peer is listed as "name", or as "server_name"
+    -- when DanNet's Full Names setting is on. Only THIS server's characters count, so a same-named
+    -- character on another server (say an EMU install on the same network) is never mistaken for one.
+    local onNet, prefix = {}, myServer:lower() .. "_"
+    for tok in (mq.TLO.DanNet.Peers() or ""):gmatch("[^|]+") do
+        tok = tok:lower()
+        if tok:sub(1, #prefix) == prefix then tok = tok:sub(#prefix + 1) end
+        if not tok:find("_", 1, true) then onNet[tok] = true end
+    end
+    -- A box that LEFT DanNet forgets our watches, while this client still calls them set, so they
+    -- would never update again. Forget ours too (free - DanNet sends nothing for a drop) so they
+    -- are asked again when the box comes back.
+    for peer in pairs(dnAsk.onNet) do
+        if not onNet[peer] then
+            for key in pairs(grpObs) do
+                local owner, item = key:match("^(.-)|(.+)$")
+                if owner == peer then
+                    local q = itemQuery(item)
+                    mq.cmdf('/squelch /dobserve %s -q "FindItemCount[%s]" -drop', peer, q)
+                    mq.cmdf('/squelch /dobserve %s -q "FindItemBankCount[%s]" -drop', peer, q)
+                    grpObs[key] = nil
+                end
+            end
+            dnAsk.silent[peer], dnAsk.warned[peer], dnAsk.landed = nil, nil, true
+        end
+    end
+    dnAsk.onNet = onNet
+    local p = dnAsk.pending
+    if p then
+        if dnLanded(p) then
+            dnAnswered(p)
+        elseif now - p.at < 20000 then
+            return   -- still out: send NOTHING else until it lands
+        else
+            -- No answer in 20s. The wait is long on purpose: past the 256 tickets, a reply that comes
+            -- in late is filed under whichever request is out THEN - another item's count - so a box
+            -- that is only zoning gets time to answer before anything else is sent.
+            dnAsk.pending = nil
+            if p.cardFor then
+                warn(string.format("\ag%s\at didn't answer the request for the \ag%s\at card - Ctrl+Right-Click it again later.", p.name, watchBare(p.cardFor.item)))
+            elseif onNet[p.peer] then
+                dnAsk.silent[p.peer] = dnAsk.silent[p.peer] or p.at
+                dnAsk.rest[p.peer] = now + (dnAsk.warned[p.peer] and 60000 or 5000)
+                local quiet = now - dnAsk.silent[p.peer]
+                if not dnAsk.warned[p.peer] and quiet >= 30000 then
+                    dnAsk.warned[p.peer] = true
+                    warn(string.format("\ag%s\at has not answered DanNet for %ds - its group counts are paused. If it stays this way, reload DanNet on this character: \ag/plugin mq2dannet unload noauto\at, then \ag/plugin mq2dannet load noauto\at", p.name, math.floor(quiet / 1000)))
+                end
+            end
+        end
+    end
+    -- Send the next request. While a fill is running, keep going within this tick as each one
+    -- lands - but for 0.3s at most, and still only ever one out.
+    local budgetEnd = now + 300
+    while true do
+        local peer, q, item, name, cardFor = nextRequest(now)
+        if not peer then return end
+        mq.cmdf('/squelch /dobserve %s -q "%s"', peer, q)
+        dnAsk.sent = dnAsk.sent + 1
+        if item then grpObs[peer .. "|" .. item] = true end   -- may hold a watch from now on: item removal drops it
+        local req = { peer = peer, name = name, q = q, at = mq.gettime(), cardFor = cardFor }
+        dnAsk.pending = req
+        local left = budgetEnd - mq.gettime()
+        if left <= 0 then return end
+        mq.delay(left, function() return dnLanded(req) end)
+        if not dnLanded(req) then return end   -- still out: checked next tick
+        dnAnswered(req)
+    end
+end
+
+-- After a card request: the item window is opening on this character. Read the item from it
+-- (MQ2ItemDisplay finds an open window by the item's ID) and save the card on its Loot Watch row.
+-- The window stays open: the click asked for it.
+local function readCardWindow()
+    local cw = dnAsk.cardWait
+    if not cw then return end
+    if not mq.TLO.Plugin('MQ2ItemDisplay').IsLoaded() then
+        dnAsk.cardWait = nil
+        warn("the item window is open, but MQ2ItemDisplay isn't loaded, so CroakWatch can't read it - no card saved.")
+        return
+    end
+    local it = mq.TLO.DisplayItem("id " .. cw.id).Item
+    if it.Name() then
+        dnAsk.cardWait = nil
+        for _, w in ipairs(lootWatch) do
+            if w == cw.w then   -- still watched: it may have been removed while the window opened
+                local card = cardFromItem(it)
+                card.link, card.from, card.day = cw.link, cw.from, os.date("%b %d")
+                w.card = card
+                saveAll()
+                info(string.format("saved the \ag%s\at card from %s's copy - hover the name any time now.", card.name, cw.from))
+            end
+        end
+    elseif mq.gettime() - cw.at > 5000 then
+        dnAsk.cardWait = nil
+        warn(string.format("the \ag%s\at item window didn't open within 5s - no card saved. Ctrl+Right-Click it again to retry.", watchBare(cw.w.item)))
     end
 end
 
@@ -2667,23 +3029,44 @@ local function renderLootWatch()
     -- inv/bank counts per watched item (cached - TLO scans are too heavy to run every frame)
     if mq.gettime() - lootCountAt > 5000 then
         lootCountAt, lootCountCache = mq.gettime(), {}
+        -- MQ's bank count is the personal bank PLUS the shared bank, merged. The shared bank belongs
+        -- to the whole account, so a spare Lore copy stashed there is not one this character holds:
+        -- read the shared slots once (bags in them included) and split them out by subtraction.
+        -- Each entry is { lowercase name, stack size } - the stack is what MQ's count adds up too.
+        local shared = {}
+        for n = 1, 10 do   -- MQ serves up to 6 slots today; past the account's real ones a slot is empty
+            local slot = mq.TLO.Me.SharedBank(n)
+            if slot.Name() then
+                shared[#shared + 1] = { slot.Name():lower(), slot.Stack() or 1 }
+                for k = 1, (slot.Container() or 0) do
+                    local it = slot.Item(k)
+                    if it.Name() then shared[#shared + 1] = { it.Name():lower(), it.Stack() or 1 } end
+                end
+            end
+        end
         for _, w in ipairs(lootWatch) do
             local q = itemQuery(w.item)   -- exact when it resolves; partial watches still work
+            -- the same match MQ uses: quoted = whole name, otherwise anywhere in it, any case
+            local bare, exact, inShared = watchBare(w.item):lower(), isExactEntry(w.item), 0
+            for _, s in ipairs(shared) do
+                if (exact and s[1] == bare) or (not exact and s[1]:find(bare, 1, true)) then inShared = inShared + s[2] end
+            end
             lootCountCache[w.item] = {
-                inv  = mq.TLO.FindItemCount(q)() or 0,
-                bank = mq.TLO.FindItemBankCount(q)() or 0,
+                inv    = mq.TLO.FindItemCount(q)() or 0,
+                bank   = math.max((mq.TLO.FindItemBankCount(q)() or 0) - inShared, 0),
+                shared = inShared,
             }
         end
     end
     imgui.TextDisabled("Sort:"); imgui.SameLine()
-    if imgui.RadioButton("Added##ls", lootSort == "added") then lootSort = "added" end
-    imgui.SameLine(); if imgui.RadioButton("Name##ls", lootSort == "name") then lootSort = "name" end
-    imgui.SameLine(); if imgui.RadioButton("Count##ls", lootSort == "count") then lootSort = "count" end
+    if imgui.RadioButton("Added##ls", ui.lootSort == "added") then ui.lootSort = "added" end
+    imgui.SameLine(); if imgui.RadioButton("Name##ls", ui.lootSort == "name") then ui.lootSort = "name" end
+    imgui.SameLine(); if imgui.RadioButton("Count##ls", ui.lootSort == "count") then ui.lootSort = "count" end
     local view = {}
     for i, w in ipairs(lootWatch) do view[#view + 1] = { idx = i, w = w } end
-    if lootSort == "name" then
+    if ui.lootSort == "name" then
         table.sort(view, function(a, b) return a.w.item:lower() < b.w.item:lower() end)
-    elseif lootSort == "count" then
+    elseif ui.lootSort == "count" then
         table.sort(view, function(a, b) return a.w.count > b.w.count end)
     end
     local rmIdx = nil
@@ -2692,29 +3075,39 @@ local function renderLootWatch()
         imgui.PushID(v.idx)
         if imgui.SmallButton("X") then rmIdx = v.idx end
         imgui.SameLine(); imgui.TextColored(0.79, 0.63, 0.91, 1, w.item)
-        itemTooltip(w.item)
+        itemTooltip(w.item, nil, w)
         imgui.SameLine(); imgui.TextColored(0.3, 1.0, 0.3, 1, "x" .. w.count)
         local c = lootCountCache[w.item]
         if c then
             imgui.SameLine(330)   -- fixed column so the counts line up regardless of item-name length
-            if c.inv + c.bank > 0 then imgui.TextColored(0.45, 0.85, 0.85, 1, string.format("inv %d   bank %d", c.inv, c.bank))
-            else imgui.TextDisabled("inv 0   bank 0") end
+            local counts = string.format("inv %d  bank %d  shared %d", c.inv, c.bank, c.shared)
+            if c.inv + c.bank + c.shared > 0 then imgui.TextColored(0.45, 0.85, 0.85, 1, counts)
+            else imgui.TextDisabled(counts) end
             if imgui.IsItemHovered() then
-                imgui.SetTooltip("your inventory + bank bags only -\nTrade Depot / Dragon's Hoard are not counted.")
+                imgui.SetTooltip("what YOU hold right now: your inventory, your own bank,\nand the SHARED bank - which belongs to your whole account,\nso a spare Lore copy you stashed there shows as shared.\nTrade Depot / Dragon's Hoard are not counted.")
             end
         end
         local g = grpCountCache[w.item]
         if g and g.total > 1 then
-            imgui.SameLine(460)
-            if g.have >= g.total then imgui.TextColored(0.3, 1.0, 0.3, 1, string.format("grp %d/%d", g.have, g.total))
-            else imgui.TextColored(0.95, 0.85, 0.35, 1, string.format("grp %d/%d", g.have, g.total)) end
+            -- the group column sits past the widest counts text, measured, so it lines up on every row
+            imgui.SameLine(330 + imgui.CalcTextSize("inv 00  bank 00  shared 00") + 20)
+            local grpText = string.format("grp %d/%d", g.have, g.total)
+            if g.waiting then imgui.TextDisabled(grpText .. " ...")   -- not every box has answered yet
+            elseif g.have >= g.total then imgui.TextColored(0.3, 1.0, 0.3, 1, grpText)
+            else imgui.TextColored(0.95, 0.85, 0.35, 1, grpText) end
             if imgui.IsItemHovered() then
                 imgui.BeginTooltip()
                 for _, p in ipairs(g.who) do
-                    if (p.inv or -1) < 0 then imgui.TextDisabled(p.name .. ": no DanNet / no data yet")
+                    if p.state == "off" then imgui.TextDisabled(p.name .. ": not on DanNet - not counted")
+                    elseif p.state == "asking" then imgui.TextDisabled(p.name .. ": asking...")
+                    elseif p.state == "silent" then imgui.TextColored(0.95, 0.85, 0.35, 1, p.name .. ": not answering - see console")
                     elseif p.inv + (p.bank or 0) > 0 then imgui.TextColored(0.3, 1.0, 0.3, 1, string.format("%s: inv %d / bank %d", p.name, p.inv, p.bank or 0))
                     else imgui.Text(string.format("%s: inv 0 / bank 0", p.name)) end
                 end
+                if g.waiting then
+                    imgui.TextDisabled("dimmed with ... = still asking the group over DanNet, one\nrequest at a time - it fills in as each box answers")
+                end
+                imgui.TextDisabled("bank here includes each account's SHARED bank -\nthe counts beside the item split out yours")
                 imgui.TextDisabled("Trade Depot / Dragon's Hoard not counted")
                 imgui.EndTooltip()
             end
@@ -2726,18 +3119,18 @@ local function renderLootWatch()
         table.remove(lootWatch, rmIdx); saveAll()
     end
     imgui.SetNextItemWidth(150)
-    lootInput = imgui.InputText("##lootin", lootInput, 128)
+    ui.lootInput = imgui.InputText("##lootin", ui.lootInput, 128)
     if imgui.IsItemHovered() then
-        if mq.TLO.Cursor() ~= nil then   -- hover with an item on your cursor -> grab its name (iTrack-style)
-            lootInput = mq.TLO.Cursor.Name() or lootInput
+        if mq.TLO.Cursor() ~= nil then   -- hover with an item on your cursor -> grab its name, then put it back
+            ui.lootInput = mq.TLO.Cursor.Name() or ui.lootInput
             mq.cmd("/autoinventory")
         else
             imgui.SetTooltip("type a partial name (case doesn't matter): silk cloth also\nwatches Silk Cloth Sandals. For ONE exact item, use quotes:\n\"Silk Cloth\" - counts and tooltips then ignore look-alikes.\nOr hover here with an item on your cursor.")
         end
     end
     imgui.SameLine()
-    if imgui.SmallButton("Add##lw") and lootInput ~= "" then
-        lootWatch[#lootWatch + 1] = { item = lootInput, count = 0 }; lootInput = ""; saveAll()
+    if imgui.SmallButton("Add##lw") and ui.lootInput ~= "" then
+        lootWatch[#lootWatch + 1] = { item = ui.lootInput, count = 0 }; ui.lootInput = ""; saveAll()
     end
     imgui.SameLine()
     if imgui.SmallButton("Cursor##lw") then
@@ -2748,7 +3141,7 @@ end
 
 -- Audition every WAV in assets/sounds/ in-game. (Future home: the OPTIONS tab.)
 local function renderSoundTest()
-    local ttsOk = mq.TLO.Plugin(TTS_PLUGIN).IsLoaded()
+    local ttsOk = mq.TLO.Plugin(SOUND.ttsPlugin).IsLoaded()
     if imgui.SmallButton("Test Voice") then
         local sample = (roster[1] and roster[1].name) or "Frenzied Ghoul"   -- demo the real "<name> is up"
         if ttsOk then mq.cmdf('/tts say "%s is up"', sample) else mq.cmd('/beep'); mq.cmd('/beep') end
@@ -2759,23 +3152,23 @@ local function renderSoundTest()
     if ttsOk then
         imgui.TextDisabled("Voice:")
         imgui.SameLine(); imgui.TextColored(0.55, 0.45, 0.75, 1, mq.TLO.TTS.Voice() or "?")
-        for i, v in ipairs(TTS_VOICES) do
+        for i, v in ipairs(SOUND.ttsVoices) do
             if i > 1 then imgui.SameLine() end
             if imgui.SmallButton(v) then mq.cmdf('/tts voice %s', v) end
         end
         imgui.SameLine(); imgui.SetNextItemWidth(80)
-        voiceInput = imgui.InputText("##voicein", voiceInput, 64)
+        ui.voiceInput = imgui.InputText("##voicein", ui.voiceInput, 64)
         imgui.SameLine()
-        if imgui.SmallButton("Set##voice") and voiceInput ~= "" then mq.cmdf('/tts voice %s', voiceInput) end
+        if imgui.SmallButton("Set##voice") and ui.voiceInput ~= "" then mq.cmdf('/tts voice %s', ui.voiceInput) end
     end
     imgui.Separator()
     if #soundFiles == 0 then imgui.TextDisabled("  no .wav files in assets/sounds/") end
     for _, f in ipairs(soundFiles) do
         imgui.PushID(f)
-        if imgui.SmallButton("Play") then mq.cmdf('/beep "%s%s"', SOUND_DIR, f) end
+        if imgui.SmallButton("Play") then mq.cmdf('/beep "%s%s"', SOUND.dir, f) end
         imgui.SameLine(); imgui.TextDisabled(f)
-        if f == WINDOW_WAV then imgui.SameLine(); imgui.TextColored(0.55, 0.75, 1.0, 1, "[window]") end
-        if f == LOOT_WAV   then imgui.SameLine(); imgui.TextColored(0.40, 0.90, 0.50, 1, "[loot]") end
+        if f == SOUND.window then imgui.SameLine(); imgui.TextColored(0.55, 0.75, 1.0, 1, "[window]") end
+        if f == SOUND.loot   then imgui.SameLine(); imgui.TextColored(0.40, 0.90, 0.50, 1, "[loot]") end
         imgui.PopID()
     end
 end
@@ -2790,10 +3183,10 @@ local function renderQuickReplies()
         imgui.PopID()
     end
     imgui.SetNextItemWidth(220)
-    replyInput = imgui.InputText("##qrin", replyInput, 128)
+    ui.replyInput = imgui.InputText("##qrin", ui.replyInput, 128)
     imgui.SameLine()
-    if imgui.SmallButton("Add##qr") and replyInput ~= "" then
-        quickReplies[#quickReplies + 1] = replyInput; replyInput = ""; saveAll()
+    if imgui.SmallButton("Add##qr") and ui.replyInput ~= "" then
+        quickReplies[#quickReplies + 1] = ui.replyInput; ui.replyInput = ""; saveAll()
     end
 end
 
@@ -2908,10 +3301,9 @@ local function renderStatsTab()
             end
 
             if imgui.CollapsingHeader("This Session", ImGuiTreeNodeFlags.DefaultOpen) then
-                local halfW = (imgui.GetContentRegionAvailVec().x - 8) * 0.5
-                imgui.BeginChild("##sessL", halfW, 178, false)
-                -- Session attribution DONUT (buttonmaster's cooldown-pie pattern: PathLineTo center
-                -- -> PathArcTo -> PathFillConvex per wedge, then a WindowBg circle punches the hole).
+                imgui.BeginChild("##session", 0, 178, false)
+                -- Session attribution DONUT, drawn as a pie: PathLineTo center -> PathArcTo ->
+                -- PathFillConvex per wedge, then a WindowBg circle punches the hole.
                 local total = sessionCroaks.self + sessionCroaks.pet + sessionCroaks.grp + sessionCroaks.other
                 local dp = imgui.GetCursorScreenPosVec()
                 local center = ImVec2(dp.x + 21, dp.y + 21)
@@ -2955,31 +3347,15 @@ local function renderStatsTab()
                 if sessionCroaks.other > 0 then imgui.TextColored(0.95, 0.85, 0.35, 1, string.format("out %d", sessionCroaks.other))
                 else imgui.TextDisabled("out 0") end
                 if imgui.IsItemHovered() then imgui.SetTooltip("kills by OUTSIDERS (not you/group/pets/mercs) -\nyellow when above zero: someone worked your camps") end
-                if imgui.RadioButton("All##scf", statsCroakFilter == "all") then statsCroakFilter = "all" end
+                if imgui.RadioButton("All##scf", ui.statsCroakFilter == "all") then ui.statsCroakFilter = "all" end
                 imgui.SameLine()
-                if imgui.RadioButton("Outsiders##scf", statsCroakFilter == "out") then statsCroakFilter = "out" end
+                if imgui.RadioButton("Outsiders##scf", ui.statsCroakFilter == "out") then ui.statsCroakFilter = "out" end
                 if imgui.IsItemHovered() then imgui.SetTooltip("audit view: show ONLY outsider kills -\nthe morning-after AFK check") end
                 imgui.EndGroup()
-                -- both halves' ledgers should start at the same height; the donut block makes
-                -- this side's header taller, so measure it and hand the Y to the loot side
-                local sessLedgerTop = imgui.GetCursorPosY()
-                imgui.BeginChild("##croakledger", 0, 0, true)
-                local shown = 0
-                local rowW = imgui.GetContentRegionAvailVec().x
-                for i = #croakLog, 1, -1 do   -- ledger keeps 24h (persisted); newest first
-                    local c = croakLog[i]
-                    if statsCroakFilter == "all" or c.kind == "other" then
-                        shown = shown + 1
-                        croakRow(c, rowW)
-                    end
-                end
-                if shown == 0 then
-                    imgui.TextDisabled(statsCroakFilter == "out" and "no outsider kills in the last 24h - camp secure" or "no croaks in the last 24h")
-                end
-                imgui.EndChild()
-                imgui.EndChild()
-                imgui.SameLine()
-                imgui.BeginChild("##sessR", 0, 178, false)
+                -- session money beside the kill counts. The drop list that used to fill the right
+                -- half is the Loot tab's Recent Drops now (v1.57), so the kill ledger gets the width.
+                imgui.SameLine(0, 24)
+                imgui.BeginGroup()
                 imgui.TextDisabled("coin"); imgui.SameLine()
                 imgui.TextColored(0.90, 0.76, 0.36, 1, coinStr(coinSession)); imgui.SameLine()
                 imgui.TextDisabled(" items"); imgui.SameLine()
@@ -2988,23 +3364,19 @@ local function renderStatsTab()
                 imgui.TextDisabled("tribute"); imgui.SameLine()
                 imgui.TextColored(0.45, 0.85, 0.85, 1, tostring(tribSession))
                 if imgui.IsItemHovered() then imgui.SetTooltip("tribute value of the items YOU looted this session") end
-                imgui.SetCursorPosY(math.max(imgui.GetCursorPosY(), sessLedgerTop))
-                imgui.BeginChild("##dropledger", 0, 0, true)
-                if #dropLog == 0 then imgui.TextDisabled("no drops seen this session") end
-                local dropW = imgui.GetContentRegionAvailVec().x
-                for i = #dropLog, 1, -1 do
-                    local d = dropLog[i]
-                    local full = d.t .. " " .. d.item .. " - " .. d.who
-                    local it = d.item
-                    if imgui.CalcTextSize(full) > dropW then
-                        local itemW = imgui.CalcTextSize(d.item)
-                        local allowed = itemW - (imgui.CalcTextSize(full) - dropW) - 14
-                        it = d.item:sub(1, math.max(5, math.floor(#d.item * allowed / math.max(itemW, 1)) - 2)) .. ".."
+                imgui.EndGroup()
+                imgui.BeginChild("##croakledger", 0, 0, true)
+                local shown = 0
+                local rowW = imgui.GetContentRegionAvailVec().x
+                for i = #croakLog, 1, -1 do   -- ledger keeps 24h (persisted); newest first
+                    local c = croakLog[i]
+                    if ui.statsCroakFilter == "all" or c.kind == "other" then
+                        shown = shown + 1
+                        croakRow(c, rowW)
                     end
-                    imgui.TextDisabled(d.t); imgui.SameLine()
-                    imgui.TextColored(0.79, 0.63, 0.91, 1, it)
-                    itemTooltip(d.item, true)   -- full card carries the full name, so truncation costs nothing
-                    imgui.SameLine(); imgui.TextColored(0.45, 0.80, 0.80, 1, "- " .. d.who)
+                end
+                if shown == 0 then
+                    imgui.TextDisabled(ui.statsCroakFilter == "out" and "no outsider kills in the last 24h - camp secure" or "no croaks in the last 24h")
                 end
                 imgui.EndChild()
                 imgui.EndChild()
@@ -3252,12 +3624,12 @@ local function renderMain()
         if imgui.BeginPopup("zonepcs") then       -- pinned + scrollable (for crowded zones like PoK)
             imgui.TextDisabled(string.format("Players in zone: %d (not your group)", #zonePcsList))
             imgui.TextDisabled("Sort:"); imgui.SameLine()
-            if imgui.RadioButton("Name", zonePcsSort == "name") then zonePcsSort = "name" end
-            imgui.SameLine(); if imgui.RadioButton("Level", zonePcsSort == "level") then zonePcsSort = "level" end
+            if imgui.RadioButton("Name", ui.zonePcsSort == "name") then ui.zonePcsSort = "name" end
+            imgui.SameLine(); if imgui.RadioButton("Level", ui.zonePcsSort == "level") then ui.zonePcsSort = "level" end
             imgui.Separator()
             local sorted = {}
             for _, p in ipairs(zonePcsList) do sorted[#sorted + 1] = p end
-            if zonePcsSort == "level" then
+            if ui.zonePcsSort == "level" then
                 table.sort(sorted, function(a, b)
                     if a.level ~= b.level then return a.level > b.level end   -- highest first
                     return a.name:lower() < b.name:lower()
@@ -3296,15 +3668,15 @@ local function renderMain()
         imgui.PopStyleColor()
         if campsOpen then
             imgui.TextDisabled("Sort:"); imgui.SameLine()
-            if imgui.RadioButton("Due", sortMode == "due") then sortMode = "due" end
-            imgui.SameLine(); if imgui.RadioButton("Name", sortMode == "name") then sortMode = "name" end
+            if imgui.RadioButton("Due", ui.sortMode == "due") then ui.sortMode = "due" end
+            imgui.SameLine(); if imgui.RadioButton("Name", ui.sortMode == "name") then ui.sortMode = "name" end
             imgui.SameLine(); imgui.TextDisabled(" Show:"); imgui.SameLine()
-            if imgui.RadioButton("All", filterMode == 0) then filterMode = 0 end
-            imgui.SameLine(); if imgui.RadioButton("Up", filterMode == 1) then filterMode = 1 end
-            imgui.SameLine(); if imgui.RadioButton("Need", filterMode == 2) then filterMode = 2 end
-            imgui.SameLine(); showHidden = imgui.Checkbox("Hidden", showHidden)
+            if imgui.RadioButton("All", ui.filterMode == 0) then ui.filterMode = 0 end
+            imgui.SameLine(); if imgui.RadioButton("Up", ui.filterMode == 1) then ui.filterMode = 1 end
+            imgui.SameLine(); if imgui.RadioButton("Need", ui.filterMode == 2) then ui.filterMode = 2 end
+            imgui.SameLine(); ui.showHidden = imgui.Checkbox("Hidden", ui.showHidden)
             if imgui.SmallButton("+ Add") then
-                addName, addPH, addOverride = "", "", 0
+                ui.addName, ui.addPH, ui.addOverride = "", "", 0
                 imgui.OpenPopup("addnamed")
             end
             if curAchID then
@@ -3334,14 +3706,14 @@ local function renderMain()
 
             local vis = {}
             for _, e in ipairs(roster) do
-                if showHidden or not e.hidden then
+                if ui.showHidden or not e.hidden then
                     local show = true
-                    if filterMode == 1 then show = e.isUp
-                    elseif filterMode == 2 then show = not e.achDone end
+                    if ui.filterMode == 1 then show = e.isUp
+                    elseif ui.filterMode == 2 then show = not e.achDone end
                     if show then vis[#vis + 1] = e end
                 end
             end
-            if sortMode == "name" then
+            if ui.sortMode == "name" then
                 table.sort(vis, function(a, b) return a.name:lower() < b.name:lower() end)
             else
                 table.sort(vis, function(a, b)
@@ -3456,15 +3828,25 @@ local function renderMain()
             renderLootWatch()
 
             imgui.SeparatorText("Recent Drops")
-            if #dropLog == 0 then imgui.TextDisabled("no drops seen this session") end
-            for i = #dropLog, math.max(1, #dropLog - 7), -1 do
-                imgui.TextDisabled(dropLog[i].t); imgui.SameLine()
-                imgui.TextColored(0.79, 0.63, 0.91, 1, dropLog[i].item)
-                itemTooltip(dropLog[i].item, true)
-                imgui.SameLine(); imgui.TextColored(0.45, 0.80, 0.80, 1, "- " .. dropLog[i].who)
+            if imgui.IsItemHovered() then imgui.SetTooltip("every loot line CroakWatch sees - yours and your group's -\nnewest first. Keeps the last 500, remembered after a restart;\nscroll down for older ones. Earlier days get a date line.") end
+            -- the same 8-line space it always had, now a window onto all 500
+            imgui.BeginChild("##recentdrops", 0, imgui.GetTextLineHeightWithSpacing() * 8 + imgui.GetStyle().WindowPadding.y * 2, true)
+            if #dropLog == 0 then imgui.TextDisabled("no drops recorded yet") end
+            local today, lastDay = os.date("%a %b %d"), nil
+            for i = #dropLog, 1, -1 do
+                local d = dropLog[i]
+                -- nothing above today's drops; each earlier day starts under its own date
+                if d.day and d.day ~= today and d.day ~= lastDay then imgui.SeparatorText(d.day) end
+                lastDay = d.day
+                imgui.TextDisabled(d.t); imgui.SameLine()
+                imgui.TextColored(0.79, 0.63, 0.91, 1, d.item)
+                itemTooltip(d.item, true)
+                imgui.SameLine(); imgui.TextColored(0.45, 0.80, 0.80, 1, "- " .. d.who)
             end
+            imgui.EndChild()
 
             imgui.SeparatorText("Top Drops")
+            if imgui.IsItemHovered() then imgui.SetTooltip("drops from your named and their PHs, looted by you or anyone in your group,\nadded up across every camp - x count, item, then the camp it drops in most") end
             -- item axis: aggregate every named's per-mob tallies across the server db
             local agg = {}
             for _, e in pairs(db) do
@@ -3638,6 +4020,8 @@ mq.bind('/croakwatch', function(arg, arg2)
         if monitorMode then info(string.format("role: \atMONITOR-ONLY\at (nothing saves)%s - server \ag%s\at, computer \ag%s\at.", writerName ~= "" and string.format(", writer is \ag%s\at", writerName) or "", myServer, myComputer))
         else info(string.format("role: \agWRITER\at (owns this server's save file) - server \ag%s\at, computer \ag%s\at.", myServer, myComputer)) end
         info(string.format("actor messages received since start: \ag%d\at.", actorMsgCount))
+        info(string.format("DanNet requests sent since start: \ag%d\at, one at a time. (DanNet gives this character 256 for its session, shared by every script on it.)", dnAsk.sent))
+        if dnAsk.pending then info(string.format("waiting on \ag%s\at for %s.", dnAsk.pending.name, dnAsk.pending.q)) end
     elseif arg == 'debug' then
         cwDebug = not cwDebug
         info("actor debug " .. (cwDebug and "ON - every send/receive echoes raw." or "OFF."))
@@ -3657,7 +4041,7 @@ mq.bind('/croakwatch', function(arg, arg2)
                 for key in pairs(db) do
                     if key:sub(1, #prefix) == prefix then db[key] = nil; removed = removed + 1 end
                 end
-                selectedName, editFor = nil, nil
+                selectedName, edit.forName = nil, nil
                 saveAll()
                 if curAchID then loadFromAchievement(true) end   -- refill the book fresh from the ach
                 rosterRebuild()
@@ -3708,8 +4092,8 @@ catalogNotice()
 -- plugin as the script terminates crashed the EQ client (v0.44, EMU where CW was the one to load it).
 -- "noauto" loads it for this session only: without it MQ writes the plugin into the user's
 -- MacroQuest.ini and it loads for every character at every start - not our setting to change.
-if not mq.TLO.Plugin(TTS_PLUGIN).IsLoaded() then
-    mq.cmd('/plugin ' .. TTS_PLUGIN .. ' load noauto')
+if not mq.TLO.Plugin(SOUND.ttsPlugin).IsLoaded() then
+    mq.cmd('/plugin ' .. SOUND.ttsPlugin .. ' load noauto')
     mq.delay(500)
 end
 
@@ -3720,7 +4104,8 @@ info(string.format("v%s loaded for \ag%s\at. Tracking \ag%d\at named in this zon
 
 local lastZone = mq.TLO.Zone.ID()
 local tick = 0
-refreshGroupCounts()   -- register DanNet observers for watched items right away (values arrive async)
+askGroupCounts()       -- start asking the group for watched-item counts, one request at a time
+refreshGroupCounts()
 
 while running do
     local z = mq.TLO.Zone.ID()
@@ -3735,7 +4120,7 @@ while running do
         watchFeed, watchUnread, watchNewCount = {}, false, 0     -- last camp's OOC/intruder lines are stale
         repopDue = nil                                           -- a repop belongs to the zone that announced it
         selectedName = nil                                       -- close any open detail panel from the old zone
-        editFor, notesDirty = nil, false                         -- drop stale sidebar edit buffers (same-name mob in the new zone must reload)
+        edit.forName, edit.notesDirty = nil, false                         -- drop stale sidebar edit buffers (same-name mob in the new zone must reload)
         lastZone = z
     end
     mq.doevents()
@@ -3743,12 +4128,19 @@ while running do
         pollSpawns()
         checkAlerts()
         pollZonePcs()
+        askGroupCounts()   -- never more than ONE DanNet request out; up to 0.3s while a fill runs
+        readCardWindow()   -- a fetched item window to read into a saved card, if one is opening
         tick = tick + 1
         if tick % 6 == 0 then refreshAchDone() end
-        if tick % 20 == 0 then refreshGroupCounts() end   -- DanNet group counts, every ~10s
+        -- the counts are free local reads: rebuilt as soon as a watch lands, every ~2s while a row is
+        -- still being asked, otherwise every ~10s (a box's count changes reach DanNet by themselves)
+        if dnAsk.landed or tick % (dnAsk.waiting and 4 or 20) == 0 then refreshGroupCounts() end
+        if tick % 20 == 0 and dropLog.unsaved then saveAll() end   -- drops (and new item cards) since the last save, in one write
     end
     mq.delay(500)
 end
+
+if dropLog.unsaved then saveAll() end   -- a clean quit keeps the last few seconds of drops too
 
 -- Writer's goodbye: monitors on this server+computer get a heads-up that saving has stopped.
 if not monitorMode then
@@ -3757,4 +4149,5 @@ end
 
 -- NOTE: deliberately no plugin unload here. Unloading MQTextToSpeech as the script exits crashed
 -- the EQ client (raced with ImGui/script teardown - hard crash, no error). Leave it loaded; the
--- user can '/plugin MQTextToSpeech unload' by hand if they want.
+-- user can '/plugin MQTextToSpeech unload noauto' by hand if they want. Without "noauto" an unload
+-- also switches the plugin OFF in MacroQuest.ini whenever it is listed there.
